@@ -13,7 +13,8 @@
  * - %s 인자는 호출 시점에 내용을 슬롯으로 복사한다 (호출 후 버퍼가 바뀌어도 안전).
  *   printf 처럼 정밀도(%.5s, %.*s)만큼만 읽으므로 NUL 이 없는 버퍼도 안전하다.
  *   %s 가 아닌 곳(%p 등)에 쓰인 포인터는 char* 라도 값(주소)만 기록한다.
- *   그래서 문자열 인자가 있으면 호출 스레드가 포맷 문자열을 한 번 훑는다 (숫자만 있으면 안 훑음).
+ *   그래서 문자열 인자가 있으면 호출 스레드가 포맷 문자열을 훑는다. 결과는 호출 위치마다
+ *   캐싱하므로 실제로 훑는 것은 호출 위치당 처음 한 번뿐이다 (숫자만 있으면 아예 안 훑음).
  * - printf 형식 검사(-Wformat)는 컴파일 시점에 그대로 동작한다.
  * - 인자는 최대 16개. long double 은 double 로 저장된다.
  * - 대가: 포맷팅 비용이 로깅 스레드 하나에 몰리므로, 스레드가 많으면 소비자가 병목이 될 수 있다.
@@ -36,6 +37,8 @@
 #define LOCKFREE_LOGGER_H
 
 #include "log_common.h"
+
+#include <stdatomic.h>
 
 typedef struct lf_logger lf_logger;
 
@@ -123,18 +126,33 @@ static inline __attribute__((format(printf, 1, 2))) void lf_fmt_check(const char
     (void)fmt;
 }
 
-/* fmt 는 정적 수명이어야 한다(포인터만 저장). 매크로에서 리터럴만 받도록 강제한다 */
+/*
+ * 포맷 문자열 분석 결과 캐시. 호출 위치마다 포맷 문자열과 인자 타입이 고정이므로
+ * 매크로가 호출 위치마다 static 으로 하나씩 두고, 처음 한 번만 포맷 문자열을 훑는다.
+ */
+enum { LF_CACHE_EMPTY, LF_CACHE_FILLING, LF_CACHE_READY };
+typedef struct {
+    _Atomic int state;
+    short plan[LF_MAX_ARGS];
+} lf_fmt_cache;
+
+/*
+ * fmt 는 정적 수명이어야 한다(포인터만 저장). 매크로에서 리터럴만 받도록 강제한다.
+ * cache: 같은 fmt 와 같은 인자 타입으로만 호출되는 곳에서만 넘긴다. 아니면 NULL.
+ */
 void lflog_record(lf_logger *lg, log_level lv, const char *file, int line,
-                  const char *fmt, const lf_arg *args, int nargs);
+                  const char *fmt, const lf_arg *args, int nargs, lf_fmt_cache *cache);
 
 #define LFLOG(lg, lv, fmt, ...)                                                    \
     do {                                                                           \
         if (0)                                                                     \
             lf_fmt_check(fmt __VA_OPT__(,) __VA_ARGS__);                           \
-        if (lflog_enabled((lg), (lv)))                                             \
+        if (lflog_enabled((lg), (lv))) {                                           \
+            static lf_fmt_cache lf_cache_;                                         \
             lflog_record((lg), (lv), __FILE__, __LINE__, "" fmt "",                \
                          (const lf_arg[]){__VA_OPT__(LF_MAP(__VA_ARGS__), ){0}},   \
-                         LF_NARGS(__VA_ARGS__));                                   \
+                         LF_NARGS(__VA_ARGS__), &lf_cache_);                       \
+        }                                                                          \
     } while (0)
 #define LFLOG_DEBUG(lg, ...) LFLOG(lg, LOG_DEBUG, __VA_ARGS__)
 #define LFLOG_INFO(lg, ...)  LFLOG(lg, LOG_INFO, __VA_ARGS__)

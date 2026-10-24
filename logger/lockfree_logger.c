@@ -211,17 +211,34 @@ static long long arg_as_i64(const lf_arg *a)
     }
 }
 
-#define NOT_STR (-1)
+/*
+ * 인자별 기록 방식 (plan). 포맷 문자열과 인자 타입에만 달려 있어서 호출 위치마다 항상 같다.
+ *   PLAN_VALUE         : 값 그대로 (포인터는 주소만, 내용을 읽지 않음)
+ *   PLAN_PREC_ARG(j)   : 문자열, 최대 길이는 j 번째 인자 값 (%.*s → 호출마다 다를 수 있음)
+ *   0 이상             : 문자열, 그 길이까지만 읽음 (PLAN_NO_PREC: 제한 없음)
+ */
+#define PLAN_VALUE (-1)
+#define PLAN_PREC_ARG(j) (-2 - (j))
+#define PLAN_NO_PREC SHRT_MAX
+
+_Static_assert(LOG_LINE_MAX * 10 < SHRT_MAX, "fixed precision must fit in short");
 
 /*
  * 포인터 인자를 어떻게 기록할지 포맷 문자열을 보고 정한다 (printf 와 같은 의미가 되도록).
  * - %s 에 쓰이는 포인터: 내용을 복사하되 정밀도만큼만 읽는다 → NUL 없는 버퍼도 안전.
  *   char* 가 아닌 unsigned char* 등도 %s 면 문자열로 출력한다.
  * - 그 외 (%p 등): 포인터 값만 기록한다 → char* 라도 내용을 읽지 않는다.
- * str_max[i]: %s 인자면 최대로 읽을 바이트 수, 아니면 NOT_STR 그대로 둔다.
  */
-static void classify_ptr_args(const char *fmt, const lf_arg *args, int nargs, int *str_max)
+static void build_plan(const char *fmt, const lf_arg *args, int nargs, short *plan)
 {
+    int has_ptr = 0;
+    for (int i = 0; i < nargs; i++) {
+        plan[i] = PLAN_VALUE;
+        has_ptr |= args[i].type == LF_ARG_STR || args[i].type == LF_ARG_PTR;
+    }
+    if (!has_ptr) /* 숫자만 있으면 포맷 문자열을 훑을 필요 없음 */
+        return;
+
     int i = 0;
     const char *f = fmt;
     while (i < nargs && (f = strchr(f, '%')) != NULL) {
@@ -239,27 +256,47 @@ static void classify_ptr_args(const char *fmt, const lf_arg *args, int nargs, in
 
         if (s.width_star)
             i++;
-        int prec = -1;
+        short str_plan = PLAN_NO_PREC;
         if (s.prec_star) {
-            if (i < nargs)
-                prec = (int)arg_as_i64(&args[i]); /* 음수면 생략한 것으로 취급 (printf 와 동일) */
+            str_plan = (short)PLAN_PREC_ARG(i);
             i++;
         } else if (s.has_prec) {
-            prec = 0; /* "%.s" 는 정밀도 0 */
+            int prec = 0; /* "%.s" 는 정밀도 0 */
             for (size_t k = 0; k < s.nprec && prec < LOG_LINE_MAX; k++)
                 prec = prec * 10 + (s.prec[k] - '0');
+            str_plan = (short)prec;
         }
         if (i >= nargs)
             break;
         if (s.conv == 's' && (args[i].type == LF_ARG_STR || args[i].type == LF_ARG_PTR))
-            str_max[i] = prec < 0 ? INT_MAX : prec;
+            plan[i] = str_plan;
         i++;
     }
 }
 
+/*
+ * 캐시가 차 있으면 그대로 쓰고, 아니면 계산한다. 처음 계산한 스레드 하나만 캐시를 채운다
+ * (동시에 처음 호출한 다른 스레드들은 각자 계산한 local 을 쓴다).
+ */
+static const short *get_plan(const char *fmt, const lf_arg *args, int nargs,
+                             lf_fmt_cache *cache, short *local)
+{
+    if (cache && atomic_load_explicit(&cache->state, memory_order_acquire) == LF_CACHE_READY)
+        return cache->plan;
+    build_plan(fmt, args, nargs, local);
+    int expect = LF_CACHE_EMPTY;
+    if (cache && atomic_compare_exchange_strong_explicit(&cache->state, &expect, LF_CACHE_FILLING,
+                                                         memory_order_relaxed,
+                                                         memory_order_relaxed)) {
+        memcpy(cache->plan, local, sizeof(short) * (size_t)nargs);
+        atomic_store_explicit(&cache->state, LF_CACHE_READY, memory_order_release);
+    }
+    return local;
+}
+
 /* 생산자 쪽: 숫자→문자열 변환 없이 값만 복사 */
 static size_t encode_record(char *buf, size_t cap, log_level lv, const char *file, int line,
-                            const char *fmt, const lf_arg *args, int nargs)
+                            const char *fmt, const lf_arg *args, int nargs, lf_fmt_cache *cache)
 {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -267,25 +304,26 @@ static size_t encode_record(char *buf, size_t cap, log_level lv, const char *fil
 
     if (nargs > LF_MAX_ARGS)
         nargs = LF_MAX_ARGS;
-    int str_max[LF_MAX_ARGS];
-    int has_ptr = 0;
-    for (int i = 0; i < nargs; i++) {
-        str_max[i] = NOT_STR;
-        has_ptr |= args[i].type == LF_ARG_STR || args[i].type == LF_ARG_PTR;
-    }
-    if (has_ptr) /* 숫자만 있으면 포맷 문자열을 훑을 필요 없음 */
-        classify_ptr_args(fmt, args, nargs, str_max);
+    short local[LF_MAX_ARGS];
+    const short *plan = get_plan(fmt, args, nargs, cache, local);
 
     size_t off = sizeof(h);
     for (int i = 0; i < nargs; i++) {
         const lf_arg *a = &args[i];
-        if (str_max[i] != NOT_STR) {
+        if (plan[i] != PLAN_VALUE) {
             if (off + 4 > cap) /* 태그 + 길이 + '\0' */
                 break;
+            int str_max = plan[i];
+            if (str_max < 0) { /* %.*s: 정밀도는 이번 호출의 인자 값. 음수면 생략과 같음 (printf 와 동일) */
+                int j = -2 - str_max;
+                str_max = j < nargs ? (int)arg_as_i64(&args[j]) : -1;
+                if (str_max < 0)
+                    str_max = INT_MAX;
+            }
             /* NULL: glibc 처럼 정밀도가 6 이상일 때만 "(null)" */
-            const char *str = a->v.s ? a->v.s : (str_max[i] >= 6 ? "(null)" : "");
+            const char *str = a->v.s ? a->v.s : (str_max >= 6 ? "(null)" : "");
             size_t room = cap - off - 4;
-            size_t n = strnlen(str, (size_t)str_max[i] < room ? (size_t)str_max[i] : room);
+            size_t n = strnlen(str, (size_t)str_max < room ? (size_t)str_max : room);
             uint16_t n16 = (uint16_t)n;
             buf[off] = (char)LF_ARG_STR;
             memcpy(buf + off + 1, &n16, 2);
@@ -701,14 +739,14 @@ void lflog_write(lf_logger *lg, log_level lv, const char *file, int line,
 }
 
 void lflog_record(lf_logger *lg, log_level lv, const char *file, int line,
-                  const char *fmt, const lf_arg *args, int nargs)
+                  const char *fmt, const lf_arg *args, int nargs, lf_fmt_cache *cache)
 {
     if (!lflog_enabled(lg, lv))
         return;
 
     /* 포맷팅 없이 값만 직렬화 (역시 슬롯을 잡기 전에) */
     char buf[LOG_LINE_MAX];
-    size_t n = encode_record(buf, sizeof(buf), lv, file, line, fmt, args, nargs);
+    size_t n = encode_record(buf, sizeof(buf), lv, file, line, fmt, args, nargs, cache);
 
     enqueue_or_wait(lg, buf, n, CELL_RECORD);
 }

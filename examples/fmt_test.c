@@ -16,17 +16,20 @@
 #include <unistd.h>
 
 #define PATH "fmt_test.log"
-#define MAX_CASES 64
+#define MAX_CASES 160
 
 static char expect[MAX_CASES][4096];
 static int ncases;
 static const char *volatile current_fmt = "";
 
+/* 같은 호출 위치를 두 번: 첫 호출은 포맷 문자열을 분석해 캐시를 채우고, 두 번째는 캐시를 쓴다 */
 #define CASE(fmt, ...)                                                          \
     do {                                                                        \
         current_fmt = fmt;                                                      \
-        snprintf(expect[ncases++], sizeof(expect[0]), fmt __VA_OPT__(,) __VA_ARGS__); \
-        LFLOG_INFO(lg, fmt __VA_OPT__(,) __VA_ARGS__);                          \
+        for (int rep_ = 0; rep_ < 2; rep_++) {                                  \
+            snprintf(expect[ncases++], sizeof(expect[0]), fmt __VA_OPT__(,) __VA_ARGS__); \
+            LFLOG_INFO(lg, fmt __VA_OPT__(,) __VA_ARGS__);                      \
+        }                                                                       \
     } while (0)
 
 /* 범위 밖 읽기로 접근 금지 페이지를 건드리면 어느 케이스인지 알리고 실패 */
@@ -103,6 +106,13 @@ int main(void)
     CASE("%.3s|%.5s|%8.2s|%-6.1s|", pkt + 2, pkt, pkt, pkt);
     CASE("%*.*s|%d|%.*s|%s", 8, 3, pkt, 7, 2, pkt + 3, "tail");
     CASE("[%.0s][%.s][%.*s]", pkt, pkt, 0, pkt);
+    /* 같은 호출 위치에서 %.*s 정밀도가 매번 달라도 그 호출의 값을 따라야 한다 (캐시는 값이 아니라 "몇 번째 인자"를 기억) */
+    for (int k = 0; k <= 5; k++)                /* 첫 호출의 정밀도(0)를 계속 쓰면 덜 복사해서 틀림 */
+        CASE("up k=%d [%.*s]", k, k, pkt);
+    for (int k = 5; k >= 0; k--)                /* 첫 호출의 정밀도(5)를 계속 쓰면 접근 금지 페이지를 읽음 */
+        CASE("down k=%d [%.*s]", k, k, pkt + 5 - k);
+    char *pkt0 = guarded("ABCDE", 6);           /* NUL 이 접근 금지 페이지 바로 앞 */
+    CASE("[%.*s]", -1, pkt0);                   /* 음수 정밀도 = 정밀도 없음 → NUL 에서 멈춰야 함 */
     CASE("%.*s|", -1, "neg prec = no limit");   /* 음수 정밀도는 생략과 같음 */
     CASE("%.1000s|", "short");                  /* 정밀도가 문자열보다 길 때 */
     char *empty = guarded("", 0);               /* 첫 바이트부터 접근 금지 */
