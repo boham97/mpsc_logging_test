@@ -5,7 +5,7 @@
 | 로거 | 접두어 | 로깅 전용 스레드 | 동기화 방식 |
 |---|---|---|---|
 | `async_logger` | `alog_` / `ALOG_*` | 있음 | 뮤텍스 + 더블 버퍼 |
-| `lockfree_logger` | `lflog_` / `LFLOG_*` | 있음 | 락프리 MPSC 링 버퍼 + futex |
+| `lockfree_logger` | `lflog_` / `LFLOG_*` | 있음 | 락프리 MPSC 링 버퍼 + futex, **지연 포맷팅** |
 | `sync_logger` | `slog_` / `SLOG_*` | 없음 | `O_APPEND` 직접 쓰기(락 없음) 또는 공유 버퍼 + 뮤텍스 |
 
 요구 사항: Linux, GCC(C11), pthread. 락프리 버전은 Linux futex를 직접 쓴다.
@@ -13,9 +13,12 @@
 ## 빌드와 실행
 
 ```sh
-make                    # liblogx.a, example, bench
+make                    # liblogx.a, example, bench, fmt_test
 ./example               # app_async.log / app_lockfree.log / app_sync.log 생성
-./bench 8 200000        # 스레드 8개 × 20만 줄로 네 가지 모드 비교 + 검증
+./bench 8 200000        # 스레드 8개 × 20만 줄로 전체 모드 비교 + 검증
+./bench 8 50000 1000    # 버스트 모드: 1000줄마다 2ms 쉼 (호출 지연 비교용)
+./fmt_test              # 지연 포맷팅 결과가 snprintf 와 같은지 검사
+make test               # fmt_test + bench 4 50000
 make tsan               # ThreadSanitizer 빌드 후 ./bench 4 20000 (libtsan 필요)
 make clean
 ```
@@ -28,11 +31,12 @@ make clean
 logger/
   log_common.[ch]       공통: 레벨, 한 줄 포맷팅, write_all
   async_logger.[ch]     방식 1: 로깅 스레드 + 뮤텍스 더블 버퍼
-  lockfree_logger.[ch]  방식 3: 로깅 스레드 + 락프리 MPSC 큐
+  lockfree_logger.[ch]  방식 3: 로깅 스레드 + 락프리 MPSC 큐 + 지연 포맷팅
   sync_logger.[ch]      방식 2: 로깅 스레드 없음
 examples/
   example.c             사용 예
   bench.c               처리량/지연 측정, 결과 파일 정합성 검증
+  fmt_test.c            지연 포맷팅 vs snprintf 비교 테스트
 Makefile
 ```
 
@@ -60,7 +64,8 @@ lf_logger    *l = lflog_open("app.log", NULL);       /* INFO, 16384 슬롯, 재�
 sync_logger  *s = slog_open("app.log", LOG_INFO, 0); /* 0: 락 없는 직접 쓰기 */
 
 ALOG_INFO(a, "user=%s id=%d", name, id);
-LFLOG_ERROR(l, "failed: %s", strerror(errno));
+LFLOG_ERROR(l, "failed: %s", strerror(errno));   /* 지연 포맷팅: fmt 는 리터럴만 */
+LFLOG_TEXT(l, LOG_INFO, dyn_fmt, x);             /* 런타임 포맷 문자열: 호출 스레드가 포맷팅 */
 SLOG_WARN(s, "retry %d", n);
 
 alog_flush(a);   /* 지금까지 넣은 로그가 디스크에 써질 때까지 대기 */
@@ -158,6 +163,38 @@ lf_logger_opts o = {
 };
 ```
 
+### 지연 포맷팅 (`LFLOG_*`)
+
+Log4j2 Async Logger처럼 문자열 포맷팅을 로깅 스레드로 넘긴다. 호출 스레드는 값만 복사한다.
+
+```
+호출 스레드:  LFLOG_INFO(lg, "T%d #%d payload=%s", id, i, str);
+              └ _Generic 으로 컴파일 시점에 타입 태그 → {I64,id} {I64,i} {STR,str}
+              └ 슬롯: [fmt 포인터][file][시각][TID][레벨][태그+값]...  (문자열만 내용 복사)
+로깅 스레드:  fmt 를 해석하며 지정자마다 태그에 맞는 값으로 snprintf → 한 줄 완성
+```
+
+- **타입 태그**: `LF_ARG(x)`는 `_Generic`으로 `lf_arg_i/u/f/s/p` 중 하나를 고른다.
+  - 정수는 64비트, 실수는 double, `char*`는 문자열, 그 밖의 포인터는 주소로 저장한다.
+  - 런타임에 포맷 문자열을 파싱하지 않는다. 구조체 같은 잘못된 타입은 컴파일 에러가 난다.
+- **포맷 문자열**: 포인터만 저장한다. 그래서 매크로가 `"" fmt ""` 연결로 리터럴만 받도록 강제한다.
+- **printf 형식 검사 유지**: 매크로 안의 `if (0) lf_fmt_check(fmt, ...)`가 `-Wformat` 경고를 그대로 낸다.
+- **printf와 같은 결과**:
+  - 로깅 스레드는 길이 수식자(`hh h l ll z j t L`)를 떼고, 저장된 타입에 맞는 수식자로 바꿔 끼운다.
+  - `hh`/`h`/없음/`l`은 그 폭으로 먼저 잘라서 printf와 결과를 맞춘다(예: `%hhd`에 300 → `44`).
+  - `%*d`, `%.*s`, `%%`, 플래그, 폭, 정밀도를 지원한다.
+- **문자열 인자**: 호출 시점에 슬롯으로 복사한다. 호출 직후 버퍼를 바꿔도 안전하다.
+- **제약**:
+  - 인자는 최대 16개다.
+  - `long double`은 double로 저장한다.
+  - `%n`은 무시하고, `%m`은 원문 그대로 출력한다.
+  - 슬롯(1KB)을 넘는 인자는 잘리거나 생략된다.
+- 런타임에 만든 포맷 문자열에는 `LFLOG_TEXT`를 쓴다. 기존 방식대로 호출 스레드가 `vsnprintf`한다.
+
+**트레이드오프**: 포맷팅 비용이 로깅 스레드 하나에 몰린다.
+- 버스트 상황(큐가 넘치지 않음)에서는 호출 지연이 3배 이상 줄어든다.
+- 쉬지 않고 쓰는 상황에서는 로깅 스레드가 병목이 된다(이 환경에서 약 300만 줄/s). 큐가 가득 차면 호출자도 그 속도로 묶인다. 아래 벤치마크 참고.
+
 ### 한계
 1. **소비자 쪽은 엄밀히 락프리가 아니다.** 슬롯 번호를 확보한 생산자가 데이터를 다 쓰기 전에 선점되면, 소비자는 순서를 지키느라 그 슬롯에서 기다린다.
    - 코어보다 스레드가 훨씬 많고 큐가 가득 차면 꼬리 지연이 커진다. 32 스레드(12코어)에서 최대 50ms까지 관측했다.
@@ -176,7 +213,7 @@ lf_logger_opts o = {
 | 모드 | 처리량 | 평균 호출 지연 | 최대 지연 |
 |---|---|---|---|
 | async (뮤텍스 더블 버퍼) | 4.3 M줄/s | 1.7 µs | 0.2~0.8 ms |
-| **lock-free (MPSC 링)** | **11.2~11.8 M줄/s** | **0.59 µs** | **~80 µs** |
+| **lock-free (MPSC 링, `LFLOG_TEXT`)** | **11.2~11.8 M줄/s** | **0.59 µs** | **~80 µs** |
 | sync direct (O_APPEND) | 0.4 M줄/s | 20 µs | ~0.1~0.2 ms |
 | sync buffered (뮤텍스 64KB) | 4.2~4.5 M줄/s | 1.7 µs | 0.2~0.3 ms |
 
@@ -185,9 +222,34 @@ lf_logger_opts o = {
 | 모드 | 처리량 | 평균 | 최대 |
 |---|---|---|---|
 | async | 5.66 M줄/s | 315 ns | 207 µs |
-| lock-free | 5.40 M줄/s | 312 ns | **17 µs** |
+| lock-free (`LFLOG_TEXT`) | 5.40 M줄/s | 312 ns | **17 µs** |
 | sync direct | 0.47 M줄/s | 4.2 µs | 84 µs |
 | sync buffered | 4.78 M줄/s | 381 ns | 129 µs |
+
+### 지연 포맷팅 vs 호출 스레드 포맷팅 (lock-free 큐는 동일)
+
+**쉬지 않고 쓸 때** (처리량, 디스크까지)
+
+| 스레드 | async (뮤텍스) | lock-free + 호출자 포맷팅 (`LFLOG_TEXT`) | lock-free + 지연 포맷팅 (`LFLOG`) |
+|---|---|---|---|
+| 1 | 3.69 M줄/s | 3.50 M줄/s | 3.35 M줄/s |
+| 2 | 5.55 | 5.63 | 3.24 |
+| 4 | 4.79 | 6.81 | 3.06 |
+| 8 | 4.72 | **11.90** | 2.76 |
+
+지연 포맷팅은 로깅 스레드 하나가 포맷팅을 전담하므로 약 300만 줄/s에서 막힌다. 호출자 포맷팅은 포맷팅이 여러 스레드로 분산된다.
+
+**버스트일 때** (`./bench N 50000 1000`: 1000줄마다 2ms 쉼, 큐가 넘치지 않음)
+
+| 스레드 | async (뮤텍스) 평균 / 최대 | `LFLOG_TEXT` 평균 / 최대 | **`LFLOG` 평균 / 최대** |
+|---|---|---|---|
+| 1 | 485 ns / 371 µs | 676 ns / 52 µs | **196 ns / 49 µs** |
+| 4 | 483 ns / 205 µs | 393 ns / 30 µs | **116 ns / 27 µs** |
+| 8 | 616 ns / 243 µs | 430 ns / 878 µs | **136 ns / 21 µs** |
+
+실제 서비스처럼 평소엔 조용하다가 몰리는 패턴에서는 지연 포맷팅이 호출자 지연을 3배 이상 줄인다.
+
+---
 
 벤치마크는 끝난 뒤 결과 파일을 다시 읽어서 다음을 검증한다. 모든 모드에서 통과했다.
 - 총 줄 수가 맞는지
@@ -207,17 +269,21 @@ lf_logger_opts o = {
 | 상황 | 추천 |
 |---|---|
 | 일반적인 서버, 단순함 우선 | `async_logger` |
-| 핫패스에서 로그 지연을 최소화, 스레드 많음 | `lockfree_logger` |
+| 핫패스에서 로그 지연을 최소화, 로그가 버스트로 몰림 | `lockfree_logger` + `LFLOG_*` (지연 포맷팅) |
+| 스레드가 많고 계속 대량으로 씀 (처리량 우선) | `lockfree_logger` + `LFLOG_TEXT` |
 | 스레드를 늘릴 수 없음, 크래시 직전 로그까지 반드시 남겨야 함 | `sync_logger` (a) 모드 |
 | 스레드 없이 빠르게, 주기적으로 flush 가능 | `sync_logger` (b) 모드 |
 
 ## 검증 상태
 
-- `make tsan`(ThreadSanitizer, 4 스레드 × 2만 줄)에서 **데이터 레이스 경고 없음**.
+- `make tsan`(ThreadSanitizer, 4 스레드 × 2만 줄)에서 **데이터 레이스 경고 없음**. 지연 포맷팅 모드와 `fmt_test`를 포함한다.
+- `fmt_test`: 20개 케이스가 `snprintf`와 글자 단위로 일치한다. 정수/실수/문자열/포인터, 플래그·폭·정밀도, `*`, 길이 수식자 잘림, 16개 인자, 호출 후 버퍼 변경, 긴 줄 잘림을 확인한다.
+- 컴파일 시점 검사 확인: 형식 불일치는 경고, 리터럴이 아닌 fmt는 에러, 구조체 인자는 에러.
 - 단, TSan은 단독 `atomic_thread_fence`를 제대로 모델링하지 못한다. 그래서 락프리 버전의 futex 깨우기(Dekker 패턴)는 TSan으로 증명되지 않았다. 일반 빌드 반복 실행에서는 멈춘 적이 없고, 깨우기가 유실돼도 100ms 타임아웃으로 복구된다.
 
 ## 다음에 해볼 만한 것
 
+- 지연 포맷팅 소비자 고속화: 플래그 없는 `%d`/`%s`는 직접 변환(itoa)해서 지정자당 `snprintf` 호출 제거, 처리량 상한 끌어올리기
 - 파일 로테이션 (크기/날짜 기준)
 - 가변 길이 락프리 바이트 링 버퍼 (메모리 효율)
 - 스레드별 SPSC 큐 + 소비자 병합 (생산자 간 CAS 경쟁 제거)

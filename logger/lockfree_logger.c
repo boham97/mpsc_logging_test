@@ -26,9 +26,12 @@
 #define cpu_relax() ((void)0)
 #endif
 
+enum { CELL_TEXT = 0, CELL_RECORD = 1 };
+
 typedef struct {
     _Alignas(CACHE_LINE) _Atomic size_t seq;  /* == pos: 비어서 생산자 대기, == pos+1: 채워져서 소비자 대기 */
     uint32_t len;
+    uint32_t kind;  /* CELL_TEXT: 완성된 한 줄, CELL_RECORD: 지연 포맷팅 레코드 */
     char data[LOG_LINE_MAX];
 } lf_cell;
 
@@ -74,7 +77,7 @@ static void wake_consumer(lf_logger *lg)
 }
 
 /* 0: 성공, -1: 큐 가득 참 */
-static int try_enqueue(lf_logger *lg, const char *buf, size_t n)
+static int try_enqueue(lf_logger *lg, const char *buf, size_t n, uint32_t kind)
 {
     size_t pos = atomic_load_explicit(&lg->enqueue_pos, memory_order_relaxed);
     lf_cell *cell;
@@ -96,9 +99,315 @@ static int try_enqueue(lf_logger *lg, const char *buf, size_t n)
     }
     memcpy(cell->data, buf, n);
     cell->len = (uint32_t)n;
+    cell->kind = kind;
     atomic_store_explicit(&cell->seq, pos + 1, memory_order_release); /* 공개 */
     return 0;
 }
+
+/* ======================== 지연 포맷팅: 레코드 직렬화 / 렌더링 ======================== */
+
+/*
+ * 레코드 레이아웃 (슬롯 data 안):
+ *   [rec_hdr][태그 1B][값] [태그 1B][값] ...
+ *   값: 정수/실수/포인터 = 8B, 문자열 = 길이 2B + 내용 + '\0'
+ * 슬롯이 모자라면 문자열은 잘리고, 그래도 안 들어가는 인자는 생략된다.
+ */
+typedef struct {
+    const char *fmt;   /* 문자열 리터럴 → 정적 수명 */
+    const char *file;  /* __FILE__ → 정적 수명 */
+    int64_t sec;
+    int32_t nsec;
+    int32_t line;
+    int32_t tid;
+    uint8_t level;
+    uint8_t nargs;     /* 실제로 직렬화된 인자 수 */
+} rec_hdr;
+
+_Static_assert(sizeof(((lf_arg *)0)->v) == 8, "lf_arg value must be 8 bytes");
+
+/* 생산자 쪽: 숫자→문자열 변환 없이 값만 복사 */
+static size_t encode_record(char *buf, size_t cap, log_level lv, const char *file, int line,
+                            const char *fmt, const lf_arg *args, int nargs)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    rec_hdr h = {fmt, file, ts.tv_sec, (int32_t)ts.tv_nsec, line, log_current_tid(), (uint8_t)lv, 0};
+
+    size_t off = sizeof(h);
+    for (int i = 0; i < nargs; i++) {
+        const lf_arg *a = &args[i];
+        if (a->type == LF_ARG_STR) {
+            if (off + 4 > cap) /* 태그 + 길이 + '\0' */
+                break;
+            const char *str = a->v.s ? a->v.s : "(null)";
+            size_t n = strnlen(str, cap - off - 4);
+            uint16_t n16 = (uint16_t)n;
+            buf[off] = (char)LF_ARG_STR;
+            memcpy(buf + off + 1, &n16, 2);
+            memcpy(buf + off + 3, str, n);
+            buf[off + 3 + n] = '\0';
+            off += 4 + n;
+        } else {
+            if (off + 9 > cap)
+                break;
+            buf[off] = (char)a->type;
+            memcpy(buf + off + 1, &a->v, 8);
+            off += 9;
+        }
+        h.nargs++;
+    }
+    memcpy(buf, &h, sizeof(h));
+    return off;
+}
+
+typedef struct {
+    const char *p;
+    int left;
+} arg_reader;
+
+static int next_arg(arg_reader *r, lf_arg *a)
+{
+    if (r->left <= 0)
+        return 0;
+    r->left--;
+    a->type = (lf_arg_type)(unsigned char)*r->p++;
+    if (a->type == LF_ARG_STR) {
+        uint16_t n;
+        memcpy(&n, r->p, 2);
+        a->v.s = r->p + 2;
+        r->p += 2 + n + 1;
+    } else {
+        memcpy(&a->v, r->p, 8);
+        r->p += 8;
+    }
+    return 1;
+}
+
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;  /* len 은 항상 cap-1 이하 */
+} outbuf;
+
+static void out_putn(outbuf *o, const char *s, size_t n)
+{
+    size_t room = o->cap - 1 - o->len;
+    if (n > room)
+        n = room;
+    memcpy(o->buf + o->len, s, n);
+    o->len += n;
+}
+
+static void out_printf(outbuf *o, const char *spec, ...)
+{
+    size_t room = o->cap - o->len;
+    if (room <= 1)
+        return;
+    va_list ap;
+    va_start(ap, spec);
+    int n = vsnprintf(o->buf + o->len, room, spec, ap);
+    va_end(ap);
+    if (n > 0)
+        o->len += ((size_t)n >= room) ? room - 1 : (size_t)n;
+}
+
+static long long arg_as_i64(const lf_arg *a)
+{
+    switch (a->type) {
+    case LF_ARG_I64: return a->v.i;
+    case LF_ARG_U64: return (long long)a->v.u;
+    case LF_ARG_F64: return (long long)a->v.d;
+    default:         return (long long)(intptr_t)a->v.p;
+    }
+}
+
+static double arg_as_f64(const lf_arg *a)
+{
+    switch (a->type) {
+    case LF_ARG_F64: return a->v.d;
+    case LF_ARG_I64: return (double)a->v.i;
+    case LF_ARG_U64: return (double)a->v.u;
+    default:         return 0.0;
+    }
+}
+
+/* 지정자와 타입이 안 맞을 때: 타입대로 출력 */
+static void out_arg_default(outbuf *o, const lf_arg *a)
+{
+    switch (a->type) {
+    case LF_ARG_I64: out_printf(o, "%lld", a->v.i); break;
+    case LF_ARG_U64: out_printf(o, "%llu", a->v.u); break;
+    case LF_ARG_F64: out_printf(o, "%g", a->v.d); break;
+    case LF_ARG_STR: out_printf(o, "%s", a->v.s); break;
+    case LF_ARG_PTR: out_printf(o, "%p", a->v.p); break;
+    }
+}
+
+enum { LM_NONE, LM_HH, LM_H, LM_L, LM_LL };
+
+/*
+ * 소비자 쪽: printf 포맷 문자열을 해석하면서 지정자 하나당 snprintf 한 번.
+ * 길이 수식자(hh/h/l/ll/z/j/t/L)는 떼어 내고, 저장된 타입(64비트 정수/double)에 맞는
+ * 수식자로 바꿔 끼운다. 단 hh/h/없음/l 은 printf 와 같은 결과가 나오도록 먼저 그 폭으로 잘라 준다.
+ */
+static void render_message(outbuf *o, const char *fmt, arg_reader *r)
+{
+    const char *f = fmt;
+    while (*f) {
+        if (*f != '%') {
+            const char *pct = strchr(f, '%');
+            size_t n = pct ? (size_t)(pct - f) : strlen(f);
+            out_putn(o, f, n);
+            f += n;
+            continue;
+        }
+        if (f[1] == '%') {
+            out_putn(o, "%", 1);
+            f += 2;
+            continue;
+        }
+
+        const char *start = f++;
+        char spec[64];
+        size_t sl = 0;
+        lf_arg a;
+        spec[sl++] = '%';
+
+        while (*f && strchr("-+ #0'", *f)) {
+            if (sl < 10)
+                spec[sl++] = *f;
+            f++;
+        }
+        if (*f == '*') {
+            f++;
+            if (next_arg(r, &a))
+                sl += (size_t)snprintf(spec + sl, sizeof(spec) - sl, "%d", (int)arg_as_i64(&a));
+        } else {
+            while (*f >= '0' && *f <= '9') {
+                if (sl < 24)
+                    spec[sl++] = *f;
+                f++;
+            }
+        }
+        if (*f == '.') {
+            f++;
+            if (*f == '*') {
+                f++;
+                if (next_arg(r, &a)) {
+                    int prec = (int)arg_as_i64(&a);
+                    if (prec >= 0) /* 음수 정밀도는 생략한 것으로 취급 (printf 와 동일) */
+                        sl += (size_t)snprintf(spec + sl, sizeof(spec) - sl, ".%d", prec);
+                }
+            } else {
+                spec[sl++] = '.';
+                while (*f >= '0' && *f <= '9') {
+                    if (sl < 40)
+                        spec[sl++] = *f;
+                    f++;
+                }
+            }
+        }
+
+        int lm = LM_NONE;
+        if (*f == 'h') {
+            f++;
+            lm = LM_H;
+            if (*f == 'h') {
+                f++;
+                lm = LM_HH;
+            }
+        } else if (*f == 'l') {
+            f++;
+            lm = LM_L;
+            if (*f == 'l') {
+                f++;
+                lm = LM_LL;
+            }
+        } else if (*f && strchr("jztLq", *f)) {
+            f++;
+            lm = LM_LL;
+        }
+
+        char conv = *f;
+        if (!conv) { /* 문자열이 지정자 중간에서 끝남 → 그대로 출력 */
+            out_putn(o, start, strlen(start));
+            break;
+        }
+        f++;
+
+        if (!strchr("diouxXcfFeEgGaAspn", conv)) { /* %m 등 모르는 지정자 → 원문 그대로 */
+            out_putn(o, start, (size_t)(f - start));
+            continue;
+        }
+        if (!next_arg(r, &a)) {
+            out_putn(o, "<?>", 3);
+            continue;
+        }
+
+        switch (conv) {
+        case 'd': case 'i': {
+            if (a.type == LF_ARG_STR) { out_arg_default(o, &a); break; }
+            long long v = arg_as_i64(&a);
+            if (lm == LM_HH) v = (signed char)v;
+            else if (lm == LM_H) v = (short)v;
+            else if (lm == LM_NONE) v = (int)v;
+            else if (lm == LM_L) v = (long)v;
+            spec[sl] = 'l'; spec[sl + 1] = 'l'; spec[sl + 2] = conv; spec[sl + 3] = '\0';
+            out_printf(o, spec, v);
+            break;
+        }
+        case 'o': case 'u': case 'x': case 'X': {
+            if (a.type == LF_ARG_STR) { out_arg_default(o, &a); break; }
+            unsigned long long v = (unsigned long long)arg_as_i64(&a);
+            if (lm == LM_HH) v = (unsigned char)v;
+            else if (lm == LM_H) v = (unsigned short)v;
+            else if (lm == LM_NONE) v = (unsigned int)v;
+            else if (lm == LM_L) v = (unsigned long)v;
+            spec[sl] = 'l'; spec[sl + 1] = 'l'; spec[sl + 2] = conv; spec[sl + 3] = '\0';
+            out_printf(o, spec, v);
+            break;
+        }
+        case 'c':
+            if (a.type == LF_ARG_STR) { out_arg_default(o, &a); break; }
+            spec[sl] = 'c'; spec[sl + 1] = '\0';
+            out_printf(o, spec, (int)arg_as_i64(&a));
+            break;
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A':
+            if (a.type == LF_ARG_STR || a.type == LF_ARG_PTR) { out_arg_default(o, &a); break; }
+            spec[sl] = conv; spec[sl + 1] = '\0';
+            out_printf(o, spec, arg_as_f64(&a));
+            break;
+        case 's':
+            if (a.type != LF_ARG_STR) { out_arg_default(o, &a); break; }
+            spec[sl] = 's'; spec[sl + 1] = '\0';
+            out_printf(o, spec, a.v.s);
+            break;
+        case 'p':
+            spec[sl] = 'p'; spec[sl + 1] = '\0';
+            out_printf(o, spec, a.type == LF_ARG_PTR ? a.v.p : (const void *)(uintptr_t)a.v.u);
+            break;
+        case 'n': /* 의미 없음 (호출자 메모리에 쓸 수 없음) → 인자만 소비 */
+            break;
+        }
+    }
+}
+
+/* 레코드 → 완성된 한 줄. 반환값: 쓴 바이트 수 ('\n' 포함, cap-1 이하) */
+static size_t render_record(char *out, size_t cap, const char *data)
+{
+    rec_hdr h;
+    memcpy(&h, data, sizeof(h));
+    struct timespec ts = {(time_t)h.sec, h.nsec};
+
+    outbuf o = {out, 0, cap - 1}; /* 마지막 '\n' 자리 확보 */
+    o.len = log_format_prefix(out, o.cap, (log_level)h.level, h.file, h.line, &ts, h.tid);
+    arg_reader r = {data + sizeof(h), h.nargs};
+    render_message(&o, h.fmt, &r);
+    out[o.len++] = '\n';
+    return o.len;
+}
+
+/* ===================================================================================== */
 
 /* 소비자: 다음 슬롯이 채워져 있으면 out 에 붙이고 1, 아니면 0 */
 static int try_dequeue(lf_logger *lg, char *out, size_t *out_len)
@@ -107,8 +416,13 @@ static int try_dequeue(lf_logger *lg, char *out, size_t *out_len)
     lf_cell *cell = &lg->cells[pos & lg->mask];
     if (atomic_load_explicit(&cell->seq, memory_order_acquire) != pos + 1)
         return 0;
-    memcpy(out + *out_len, cell->data, cell->len);
-    *out_len += cell->len;
+    if (cell->kind == CELL_TEXT) {
+        memcpy(out + *out_len, cell->data, cell->len);
+        *out_len += cell->len;
+    } else {
+        /* 포맷팅은 여기서 (호출자는 이미 다른 일 하는 중) */
+        *out_len += render_record(out + *out_len, LOG_LINE_MAX, cell->data);
+    }
     /* 슬롯 반납: 한 바퀴 뒤의 생산자(pos + capacity)가 쓸 수 있게 */
     atomic_store_explicit(&cell->seq, pos + lg->mask + 1, memory_order_release);
     lg->dequeue_pos = pos + 1;
@@ -248,6 +562,20 @@ void lflog_close(lf_logger *lg)
     free(lg);
 }
 
+/* 큐에 넣기. 가득 차면 옵션에 따라 버리거나 소비자를 깨우고 재시도 */
+static void enqueue_or_wait(lf_logger *lg, const char *buf, size_t n, uint32_t kind)
+{
+    while (try_enqueue(lg, buf, n, kind) != 0) {
+        if (lg->drop_on_full || atomic_load_explicit(&lg->stop, memory_order_relaxed)) {
+            atomic_fetch_add_explicit(&lg->dropped, 1, memory_order_relaxed);
+            return;
+        }
+        wake_consumer(lg);
+        sched_yield();
+    }
+    wake_consumer(lg);
+}
+
 void lflog_write(lf_logger *lg, log_level lv, const char *file, int line,
                  const char *fmt, ...)
 {
@@ -261,15 +589,20 @@ void lflog_write(lf_logger *lg, log_level lv, const char *file, int line,
     size_t n = log_format_line(buf, sizeof(buf), lv, file, line, fmt, ap);
     va_end(ap);
 
-    while (try_enqueue(lg, buf, n) != 0) {
-        if (lg->drop_on_full || atomic_load_explicit(&lg->stop, memory_order_relaxed)) {
-            atomic_fetch_add_explicit(&lg->dropped, 1, memory_order_relaxed);
-            return;
-        }
-        wake_consumer(lg);
-        sched_yield();
-    }
-    wake_consumer(lg);
+    enqueue_or_wait(lg, buf, n, CELL_TEXT);
+}
+
+void lflog_record(lf_logger *lg, log_level lv, const char *file, int line,
+                  const char *fmt, const lf_arg *args, int nargs)
+{
+    if (!lflog_enabled(lg, lv))
+        return;
+
+    /* 포맷팅 없이 값만 직렬화 (역시 슬롯을 잡기 전에) */
+    char buf[LOG_LINE_MAX];
+    size_t n = encode_record(buf, sizeof(buf), lv, file, line, fmt, args, nargs);
+
+    enqueue_or_wait(lg, buf, n, CELL_RECORD);
 }
 
 void lflog_flush(lf_logger *lg)

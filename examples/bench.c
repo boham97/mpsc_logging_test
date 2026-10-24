@@ -1,9 +1,11 @@
 /*
- * 네 가지 로거를 같은 조건(N 스레드 x M 줄)으로 돌려
+ * 로거들을 같은 조건(N 스레드 x M 줄)으로 돌려
  *  1) 처리량 / 호출 지연시간(평균, 최대)을 재고
  *  2) 결과 파일을 다시 읽어 줄 유실·섞임·스레드별 순서 뒤바뀜이 없는지 검증한다.
  *
- * 사용법: ./bench [threads=8] [lines_per_thread=200000]
+ * 사용법: ./bench [threads=8] [lines_per_thread=200000] [burst=0]
+ *   burst > 0 이면 burst 줄마다 2ms 쉰다 (평소엔 조용하다가 몰아서 찍는 상황).
+ *   이때는 처리량보다 호출 지연시간을 보면 된다.
  */
 #define _GNU_SOURCE
 #include "../logger/async_logger.h"
@@ -17,12 +19,13 @@
 #include <time.h>
 #include <unistd.h>
 
-typedef enum { MODE_ASYNC, MODE_LOCKFREE, MODE_SYNC_DIRECT, MODE_SYNC_BUFFERED } mode_t_;
+typedef enum { MODE_ASYNC, MODE_LOCKFREE_TEXT, MODE_LOCKFREE, MODE_SYNC_DIRECT, MODE_SYNC_BUFFERED } mode_t_;
 
 static const char *mode_name[] = {"async (logging thread, mutex double buffer)",
-                                  "lock-free (logging thread, MPSC ring)", "sync direct (O_APPEND, no lock)",
+                                  "lock-free, caller formats (LFLOG_TEXT)",
+                                  "lock-free, deferred formatting (LFLOG)", "sync direct (O_APPEND, no lock)",
                                   "sync buffered (mutex, 64KB)"};
-static const char *mode_file[] = {"bench_async.log", "bench_lockfree.log", "bench_sync_direct.log",
+static const char *mode_file[] = {"bench_async.log", "bench_lockfree_text.log", "bench_lockfree.log", "bench_sync_direct.log",
                                   "bench_sync_buffered.log"};
 
 typedef struct {
@@ -37,6 +40,7 @@ typedef struct {
 } worker_arg;
 
 static pthread_barrier_t start_barrier;
+static int burst;
 
 static double now_ns(void)
 {
@@ -53,6 +57,8 @@ static void *worker(void *p)
         double t0 = now_ns();
         if (a->mode == MODE_ASYNC)
             ALOG_INFO(a->alg, "T%d #%d payload=%s", a->id, i, "the quick brown fox jumps over the lazy dog");
+        else if (a->mode == MODE_LOCKFREE_TEXT)
+            LFLOG_TEXT(a->lfg, LOG_INFO, "T%d #%d payload=%s", a->id, i, "the quick brown fox jumps over the lazy dog");
         else if (a->mode == MODE_LOCKFREE)
             LFLOG_INFO(a->lfg, "T%d #%d payload=%s", a->id, i, "the quick brown fox jumps over the lazy dog");
         else
@@ -61,6 +67,10 @@ static void *worker(void *p)
         a->sum_ns += dt;
         if (dt > a->max_ns)
             a->max_ns = dt;
+        if (burst > 0 && (i + 1) % burst == 0) {
+            struct timespec ts = {0, 2 * 1000 * 1000};
+            nanosleep(&ts, NULL);
+        }
     }
     return NULL;
 }
@@ -115,7 +125,7 @@ static int run(mode_t_ mode, int nthreads, int lines)
     if (mode == MODE_ASYNC) {
         async_logger_opts o = {LOG_INFO, 8u << 20, 100, 0 /* 대기: 유실 없음 */};
         alg = alog_open(path, &o);
-    } else if (mode == MODE_LOCKFREE) {
+    } else if (mode == MODE_LOCKFREE || mode == MODE_LOCKFREE_TEXT) {
         lf_logger_opts o = {LOG_INFO, 16384, 0 /* 재시도: 유실 없음 */};
         lfg = lflog_open(path, &o);
     } else {
@@ -171,10 +181,13 @@ int main(int argc, char **argv)
 {
     int nthreads = argc > 1 ? atoi(argv[1]) : 8;
     int lines = argc > 2 ? atoi(argv[2]) : 200000;
-    printf("threads=%d, lines/thread=%d, total=%ld\n\n", nthreads, lines, (long)nthreads * lines);
+    burst = argc > 3 ? atoi(argv[3]) : 0;
+    printf("threads=%d, lines/thread=%d, total=%ld, burst=%d\n\n", nthreads, lines,
+           (long)nthreads * lines, burst);
 
     int rc = 0;
     rc |= run(MODE_ASYNC, nthreads, lines);
+    rc |= run(MODE_LOCKFREE_TEXT, nthreads, lines);
     rc |= run(MODE_LOCKFREE, nthreads, lines);
     rc |= run(MODE_SYNC_DIRECT, nthreads, lines);
     rc |= run(MODE_SYNC_BUFFERED, nthreads, lines);

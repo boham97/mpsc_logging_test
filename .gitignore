@@ -3,3 +3,4 @@
 *.log
 /example
 /bench
+/fmt_test

@@ -17,12 +17,12 @@ const char *log_level_name(log_level lv)
 }
 
 /* 커널 스레드 ID는 스레드마다 한 번만 조회 */
-static pid_t current_tid(void)
+int log_current_tid(void)
 {
     static _Thread_local pid_t tid = 0;
     if (tid == 0)
         tid = (pid_t)syscall(SYS_gettid);
-    return tid;
+    return (int)tid;
 }
 
 static const char *base_name(const char *path)
@@ -31,29 +31,36 @@ static const char *base_name(const char *path)
     return slash ? slash + 1 : path;
 }
 
-size_t log_format_line(char *out, size_t cap, log_level lv,
-                       const char *file, int line, const char *fmt, va_list ap)
+size_t log_format_prefix(char *out, size_t cap, log_level lv, const char *file, int line,
+                         const struct timespec *ts, int tid)
 {
     /* localtime_r/strftime 은 비싸므로 초 단위 문자열을 스레드별로 캐싱 */
     static _Thread_local time_t cached_sec = -1;
     static _Thread_local char cached_time[32];
 
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    if (ts.tv_sec != cached_sec) {
+    if (ts->tv_sec != cached_sec) {
         struct tm tm;
-        localtime_r(&ts.tv_sec, &tm);
+        localtime_r(&ts->tv_sec, &tm);
         strftime(cached_time, sizeof(cached_time), "%Y-%m-%d %H:%M:%S", &tm);
-        cached_sec = ts.tv_sec;
+        cached_sec = ts->tv_sec;
     }
 
-    size_t limit = cap - 1; /* 마지막 '\n' 자리 확보 */
-    int n = snprintf(out, limit, "%s.%06ld [%s] %d %s:%d | ",
-                     cached_time, ts.tv_nsec / 1000, log_level_name(lv),
-                     (int)current_tid(), base_name(file), line);
-    size_t len = (n < 0) ? 0 : ((size_t)n >= limit ? limit - 1 : (size_t)n);
+    int n = snprintf(out, cap, "%s.%06ld [%s] %d %s:%d | ",
+                     cached_time, ts->tv_nsec / 1000, log_level_name(lv),
+                     tid, base_name(file), line);
+    return (n < 0) ? 0 : ((size_t)n >= cap ? cap - 1 : (size_t)n);
+}
 
-    n = vsnprintf(out + len, limit - len, fmt, ap);
+size_t log_format_line(char *out, size_t cap, log_level lv,
+                       const char *file, int line, const char *fmt, va_list ap)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    size_t limit = cap - 1; /* 마지막 '\n' 자리 확보 */
+    size_t len = log_format_prefix(out, limit, lv, file, line, &ts, log_current_tid());
+
+    int n = vsnprintf(out + len, limit - len, fmt, ap);
     if (n > 0)
         len += ((size_t)n >= limit - len) ? limit - len - 1 : (size_t)n;
 
