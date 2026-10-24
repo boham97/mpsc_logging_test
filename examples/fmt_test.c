@@ -5,11 +5,13 @@
 #include "../logger/lockfree_logger.h"
 
 #include <limits.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -18,16 +20,44 @@
 
 static char expect[MAX_CASES][4096];
 static int ncases;
+static const char *volatile current_fmt = "";
+
 #define CASE(fmt, ...)                                                          \
     do {                                                                        \
+        current_fmt = fmt;                                                      \
         snprintf(expect[ncases++], sizeof(expect[0]), fmt __VA_OPT__(,) __VA_ARGS__); \
         LFLOG_INFO(lg, fmt __VA_OPT__(,) __VA_ARGS__);                          \
     } while (0)
+
+/* 범위 밖 읽기로 접근 금지 페이지를 건드리면 어느 케이스인지 알리고 실패 */
+static void on_segv(int sig)
+{
+    (void)sig;
+    static const char msg[] = "FAIL: 범위 밖 읽기 (SIGSEGV), 케이스: ";
+    write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+    write(STDOUT_FILENO, (const char *)current_fmt, strlen((const char *)current_fmt));
+    write(STDOUT_FILENO, "\n", 1);
+    _exit(1);
+}
+
+/* 접근 금지 페이지 바로 앞에 data 를 NUL 없이 놓는다 → 끝을 넘어 읽으면 즉시 SIGSEGV */
+static char *guarded(const char *data, size_t n)
+{
+    long pg = sysconf(_SC_PAGESIZE);
+    char *m = mmap(NULL, 2 * (size_t)pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED || mprotect(m + pg, (size_t)pg, PROT_NONE) != 0) {
+        perror("mmap");
+        exit(1);
+    }
+    memcpy(m + pg - n, data, n);
+    return m + pg - n;
+}
 
 enum color { RED, GREEN, BLUE };
 
 int main(void)
 {
+    signal(SIGSEGV, on_segv);
     unlink(PATH);
     lf_logger *lg = lflog_open(PATH, NULL);
     if (!lg) {
@@ -63,6 +93,37 @@ int main(void)
     static char big[3000];
     memset(big, 'x', sizeof(big) - 1);
     CASE("big=%s", big);
+
+    /*
+     * 정밀도 있는 %s: printf 처럼 정밀도만큼만 읽어야 한다 (NUL 없는 버퍼).
+     * 버퍼 바로 뒤가 접근 금지 페이지라서, 더 읽으면 여기서 SIGSEGV 로 실패한다.
+     */
+    char *pkt = guarded("ABCDE", 5);
+    CASE("pkt=%.*s n=%d", 5, pkt, 42);          /* 뒤 인자가 <?> 로 밀리지 않아야 함 */
+    CASE("%.3s|%.5s|%8.2s|%-6.1s|", pkt + 2, pkt, pkt, pkt);
+    CASE("%*.*s|%d|%.*s|%s", 8, 3, pkt, 7, 2, pkt + 3, "tail");
+    CASE("[%.0s][%.s][%.*s]", pkt, pkt, 0, pkt);
+    CASE("%.*s|", -1, "neg prec = no limit");   /* 음수 정밀도는 생략과 같음 */
+    CASE("%.1000s|", "short");                  /* 정밀도가 문자열보다 길 때 */
+    char *empty = guarded("", 0);               /* 첫 바이트부터 접근 금지 */
+    CASE("[%.0s][%.*s]", empty, 0, empty);
+
+    /* %p 에 넘긴 char* 는 내용을 읽지 않고 호출자 주소를 그대로 찍어야 한다 */
+    char cbuf[] = "hello";
+    const char *ccp = cbuf;
+    CASE("%p %p", cbuf, ccp);
+    CASE("%p|%s", empty, "after");              /* 읽을 수 없는 메모리를 가리키는 char* */
+    CASE("%p %.2s %p", pkt, pkt, pkt + 1);
+
+    /* char* 가 아닌 포인터도 %s 면 문자열로 (printf 와 같음) */
+    unsigned char ubuf[] = "unsigned";
+    const uint8_t *u8 = (const uint8_t *)"uint8";
+    CASE("%s %s %.4s", ubuf, u8, (unsigned char *)guarded("WXYZ", 4));
+
+    /* NULL: glibc 는 정밀도가 6 미만이면 빈 문자열 */
+    char *volatile null_v = NULL;
+    char *np = null_v;
+    CASE("[%s][%.3s][%.6s][%.*s]", np, np, np, 10, np);
 
     lflog_close(lg);
 

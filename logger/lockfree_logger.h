@@ -11,7 +11,9 @@
  * - 인자 타입은 _Generic 으로 "컴파일 시점에" 태그를 붙인다 (런타임에 포맷 문자열 파싱 안 함).
  * - 포맷 문자열은 포인터만 넘긴다 → 반드시 문자열 리터럴이어야 한다 (매크로가 강제함).
  * - %s 인자는 호출 시점에 내용을 슬롯으로 복사한다 (호출 후 버퍼가 바뀌어도 안전).
- *   %p 등 포인터는 값(주소)만 기록한다.
+ *   printf 처럼 정밀도(%.5s, %.*s)만큼만 읽으므로 NUL 이 없는 버퍼도 안전하다.
+ *   %s 가 아닌 곳(%p 등)에 쓰인 포인터는 char* 라도 값(주소)만 기록한다.
+ *   그래서 문자열 인자가 있으면 호출 스레드가 포맷 문자열을 한 번 훑는다 (숫자만 있으면 안 훑음).
  * - printf 형식 검사(-Wformat)는 컴파일 시점에 그대로 동작한다.
  * - 인자는 최대 16개. long double 은 double 로 저장된다.
  * - 대가: 포맷팅 비용이 로깅 스레드 하나에 몰리므로, 스레드가 많으면 소비자가 병목이 될 수 있다.
@@ -86,6 +88,8 @@ static inline lf_arg lf_arg_p(const void *v) { return (lf_arg){LF_ARG_PTR, {.p =
     float: lf_arg_f, double: lf_arg_f, long double: lf_arg_f,                \
     char *: lf_arg_s, const char *: lf_arg_s,                                \
     default: lf_arg_p)(x)
+
+#define LF_MAX_ARGS 16 /* 넘는 인자는 버린다 (렌더링 시 <?>) */
 
 /* 가변 인자 개수 세기 (0~16) */
 #define LF_NARGS(...) LF_NARGS_(__VA_ARGS__ __VA_OPT__(,) \

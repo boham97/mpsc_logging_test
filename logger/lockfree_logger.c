@@ -2,6 +2,7 @@
 #include "lockfree_logger.h"
 
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
@@ -125,6 +126,137 @@ typedef struct {
 
 _Static_assert(sizeof(((lf_arg *)0)->v) == 8, "lf_arg value must be 8 bytes");
 
+enum { LM_NONE, LM_HH, LM_H, LM_L, LM_LL };
+
+#define KNOWN_CONVS "diouxXcfFeEgGaAspn" /* 인자를 하나 소비하는 변환 문자 */
+
+/*
+ * printf 지정자 하나를 해석한 결과. 생산자(포인터 인자 분류)와 소비자(렌더링)가
+ * 같은 함수를 써서, 어느 인자가 어느 지정자에 쓰이는지 해석이 어긋나지 않게 한다.
+ */
+typedef struct {
+    const char *flags, *width, *prec;  /* 원문에서의 위치 */
+    size_t nflags, nwidth, nprec;
+    int width_star, has_prec, prec_star;
+    int lm;
+    char conv;        /* 0: 문자열이 지정자 중간에서 끝남 */
+    const char *end;  /* 지정자 바로 다음 글자 */
+} fmt_spec;
+
+static int is_digit(char c)
+{
+    return c >= '0' && c <= '9';
+}
+
+/* f 는 '%' 다음 글자를 가리킨다 ("%%" 는 호출자가 처리) */
+static void parse_spec(const char *f, fmt_spec *s)
+{
+    s->flags = f;
+    while (*f && strchr("-+ #0'", *f))
+        f++;
+    s->nflags = (size_t)(f - s->flags);
+
+    s->width_star = (*f == '*');
+    if (s->width_star)
+        f++;
+    s->width = f;
+    while (!s->width_star && is_digit(*f))
+        f++;
+    s->nwidth = (size_t)(f - s->width);
+
+    s->has_prec = (*f == '.');
+    s->prec_star = 0;
+    if (s->has_prec) {
+        f++;
+        s->prec_star = (*f == '*');
+        if (s->prec_star)
+            f++;
+    }
+    s->prec = f;
+    while (s->has_prec && !s->prec_star && is_digit(*f))
+        f++;
+    s->nprec = (size_t)(f - s->prec);
+
+    s->lm = LM_NONE;
+    if (*f == 'h') {
+        f++;
+        s->lm = LM_H;
+        if (*f == 'h') {
+            f++;
+            s->lm = LM_HH;
+        }
+    } else if (*f == 'l') {
+        f++;
+        s->lm = LM_L;
+        if (*f == 'l') {
+            f++;
+            s->lm = LM_LL;
+        }
+    } else if (*f && strchr("jztLq", *f)) {
+        f++;
+        s->lm = LM_LL;
+    }
+
+    s->conv = *f;
+    s->end = *f ? f + 1 : f;
+}
+
+static long long arg_as_i64(const lf_arg *a)
+{
+    switch (a->type) {
+    case LF_ARG_I64: return a->v.i;
+    case LF_ARG_U64: return (long long)a->v.u;
+    case LF_ARG_F64: return (long long)a->v.d;
+    default:         return (long long)(intptr_t)a->v.p;
+    }
+}
+
+#define NOT_STR (-1)
+
+/*
+ * 포인터 인자를 어떻게 기록할지 포맷 문자열을 보고 정한다 (printf 와 같은 의미가 되도록).
+ * - %s 에 쓰이는 포인터: 내용을 복사하되 정밀도만큼만 읽는다 → NUL 없는 버퍼도 안전.
+ *   char* 가 아닌 unsigned char* 등도 %s 면 문자열로 출력한다.
+ * - 그 외 (%p 등): 포인터 값만 기록한다 → char* 라도 내용을 읽지 않는다.
+ * str_max[i]: %s 인자면 최대로 읽을 바이트 수, 아니면 NOT_STR 그대로 둔다.
+ */
+static void classify_ptr_args(const char *fmt, const lf_arg *args, int nargs, int *str_max)
+{
+    int i = 0;
+    const char *f = fmt;
+    while (i < nargs && (f = strchr(f, '%')) != NULL) {
+        if (f[1] == '%') {
+            f += 2;
+            continue;
+        }
+        fmt_spec s;
+        parse_spec(f + 1, &s);
+        if (!s.conv)
+            break;
+        f = s.end;
+        if (!strchr(KNOWN_CONVS, s.conv))
+            continue;
+
+        if (s.width_star)
+            i++;
+        int prec = -1;
+        if (s.prec_star) {
+            if (i < nargs)
+                prec = (int)arg_as_i64(&args[i]); /* 음수면 생략한 것으로 취급 (printf 와 동일) */
+            i++;
+        } else if (s.has_prec) {
+            prec = 0; /* "%.s" 는 정밀도 0 */
+            for (size_t k = 0; k < s.nprec && prec < LOG_LINE_MAX; k++)
+                prec = prec * 10 + (s.prec[k] - '0');
+        }
+        if (i >= nargs)
+            break;
+        if (s.conv == 's' && (args[i].type == LF_ARG_STR || args[i].type == LF_ARG_PTR))
+            str_max[i] = prec < 0 ? INT_MAX : prec;
+        i++;
+    }
+}
+
 /* 생산자 쪽: 숫자→문자열 변환 없이 값만 복사 */
 static size_t encode_record(char *buf, size_t cap, log_level lv, const char *file, int line,
                             const char *fmt, const lf_arg *args, int nargs)
@@ -133,14 +265,27 @@ static size_t encode_record(char *buf, size_t cap, log_level lv, const char *fil
     clock_gettime(CLOCK_REALTIME, &ts);
     rec_hdr h = {fmt, file, ts.tv_sec, (int32_t)ts.tv_nsec, line, log_current_tid(), (uint8_t)lv, 0};
 
+    if (nargs > LF_MAX_ARGS)
+        nargs = LF_MAX_ARGS;
+    int str_max[LF_MAX_ARGS];
+    int has_ptr = 0;
+    for (int i = 0; i < nargs; i++) {
+        str_max[i] = NOT_STR;
+        has_ptr |= args[i].type == LF_ARG_STR || args[i].type == LF_ARG_PTR;
+    }
+    if (has_ptr) /* 숫자만 있으면 포맷 문자열을 훑을 필요 없음 */
+        classify_ptr_args(fmt, args, nargs, str_max);
+
     size_t off = sizeof(h);
     for (int i = 0; i < nargs; i++) {
         const lf_arg *a = &args[i];
-        if (a->type == LF_ARG_STR) {
+        if (str_max[i] != NOT_STR) {
             if (off + 4 > cap) /* 태그 + 길이 + '\0' */
                 break;
-            const char *str = a->v.s ? a->v.s : "(null)";
-            size_t n = strnlen(str, cap - off - 4);
+            /* NULL: glibc 처럼 정밀도가 6 이상일 때만 "(null)" */
+            const char *str = a->v.s ? a->v.s : (str_max[i] >= 6 ? "(null)" : "");
+            size_t room = cap - off - 4;
+            size_t n = strnlen(str, (size_t)str_max[i] < room ? (size_t)str_max[i] : room);
             uint16_t n16 = (uint16_t)n;
             buf[off] = (char)LF_ARG_STR;
             memcpy(buf + off + 1, &n16, 2);
@@ -150,7 +295,8 @@ static size_t encode_record(char *buf, size_t cap, log_level lv, const char *fil
         } else {
             if (off + 9 > cap)
                 break;
-            buf[off] = (char)a->type;
+            /* %s 가 아닌 곳에 쓰인 char* 는 포인터 값으로 기록 (v.s 와 v.p 는 같은 자리) */
+            buf[off] = (char)(a->type == LF_ARG_STR ? LF_ARG_PTR : a->type);
             memcpy(buf + off + 1, &a->v, 8);
             off += 9;
         }
@@ -211,14 +357,12 @@ static void out_printf(outbuf *o, const char *spec, ...)
         o->len += ((size_t)n >= room) ? room - 1 : (size_t)n;
 }
 
-static long long arg_as_i64(const lf_arg *a)
+/* src 를 spec 끝에 붙이되 spec 길이가 limit 를 넘지 않게 한다 */
+static size_t spec_append(char *spec, size_t sl, const char *src, size_t n, size_t limit)
 {
-    switch (a->type) {
-    case LF_ARG_I64: return a->v.i;
-    case LF_ARG_U64: return (long long)a->v.u;
-    case LF_ARG_F64: return (long long)a->v.d;
-    default:         return (long long)(intptr_t)a->v.p;
-    }
+    for (size_t k = 0; k < n && sl < limit; k++)
+        spec[sl++] = src[k];
+    return sl;
 }
 
 static double arg_as_f64(const lf_arg *a)
@@ -243,8 +387,6 @@ static void out_arg_default(outbuf *o, const lf_arg *a)
     }
 }
 
-enum { LM_NONE, LM_HH, LM_H, LM_L, LM_LL };
-
 /*
  * 소비자 쪽: printf 포맷 문자열을 해석하면서 지정자 하나당 snprintf 한 번.
  * 길이 수식자(hh/h/l/ll/z/j/t/L)는 떼어 내고, 저장된 타입(64비트 정수/double)에 맞는
@@ -267,78 +409,44 @@ static void render_message(outbuf *o, const char *fmt, arg_reader *r)
             continue;
         }
 
-        const char *start = f++;
-        char spec[64];
-        size_t sl = 0;
-        lf_arg a;
-        spec[sl++] = '%';
-
-        while (*f && strchr("-+ #0'", *f)) {
-            if (sl < 10)
-                spec[sl++] = *f;
-            f++;
-        }
-        if (*f == '*') {
-            f++;
-            if (next_arg(r, &a))
-                sl += (size_t)snprintf(spec + sl, sizeof(spec) - sl, "%d", (int)arg_as_i64(&a));
-        } else {
-            while (*f >= '0' && *f <= '9') {
-                if (sl < 24)
-                    spec[sl++] = *f;
-                f++;
-            }
-        }
-        if (*f == '.') {
-            f++;
-            if (*f == '*') {
-                f++;
-                if (next_arg(r, &a)) {
-                    int prec = (int)arg_as_i64(&a);
-                    if (prec >= 0) /* 음수 정밀도는 생략한 것으로 취급 (printf 와 동일) */
-                        sl += (size_t)snprintf(spec + sl, sizeof(spec) - sl, ".%d", prec);
-                }
-            } else {
-                spec[sl++] = '.';
-                while (*f >= '0' && *f <= '9') {
-                    if (sl < 40)
-                        spec[sl++] = *f;
-                    f++;
-                }
-            }
-        }
-
-        int lm = LM_NONE;
-        if (*f == 'h') {
-            f++;
-            lm = LM_H;
-            if (*f == 'h') {
-                f++;
-                lm = LM_HH;
-            }
-        } else if (*f == 'l') {
-            f++;
-            lm = LM_L;
-            if (*f == 'l') {
-                f++;
-                lm = LM_LL;
-            }
-        } else if (*f && strchr("jztLq", *f)) {
-            f++;
-            lm = LM_LL;
-        }
-
-        char conv = *f;
+        const char *start = f;
+        fmt_spec s;
+        parse_spec(f + 1, &s);
+        f = s.end;
+        int lm = s.lm;
+        char conv = s.conv;
         if (!conv) { /* 문자열이 지정자 중간에서 끝남 → 그대로 출력 */
             out_putn(o, start, strlen(start));
             break;
         }
-        f++;
-
-        if (!strchr("diouxXcfFeEgGaAspn", conv)) { /* %m 등 모르는 지정자 → 원문 그대로 */
+        if (!strchr(KNOWN_CONVS, conv)) { /* %m 등 모르는 지정자 → 원문 그대로 */
             out_putn(o, start, (size_t)(f - start));
             continue;
         }
+
+        /* 플래그/폭/정밀도를 다시 조립. 길이 수식자와 변환 문자는 아래에서 붙인다 */
+        char spec[64];
+        size_t sl = 0;
+        lf_arg a;
+        spec[sl++] = '%';
+        sl = spec_append(spec, sl, s.flags, s.nflags, 10);
+        if (s.width_star) {
+            if (next_arg(r, &a))
+                sl += (size_t)snprintf(spec + sl, sizeof(spec) - sl, "%d", (int)arg_as_i64(&a));
+        } else {
+            sl = spec_append(spec, sl, s.width, s.nwidth, 24);
+        }
+        if (s.prec_star) {
+            if (next_arg(r, &a)) {
+                int prec = (int)arg_as_i64(&a);
+                if (prec >= 0) /* 음수 정밀도는 생략한 것으로 취급 (printf 와 동일) */
+                    sl += (size_t)snprintf(spec + sl, sizeof(spec) - sl, ".%d", prec);
+            }
+        } else if (s.has_prec) {
+            spec[sl++] = '.';
+            sl = spec_append(spec, sl, s.prec, s.nprec, 40);
+        }
+
         if (!next_arg(r, &a)) {
             out_putn(o, "<?>", 3);
             continue;
