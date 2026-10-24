@@ -6,7 +6,7 @@ CFLAGS  += -pthread
 LIB_SRC = logger/log_common.c logger/async_logger.c logger/lockfree_logger.c logger/sync_logger.c
 LIB_OBJ = $(LIB_SRC:.c=.o)
 
-all: liblogx.a example bench fmt_test
+all: liblogx.a example bench fmt_test fmt_bench
 
 liblogx.a: $(LIB_OBJ)
 	ar rcs $@ $^
@@ -19,6 +19,10 @@ bench: examples/bench.c liblogx.a
 
 fmt_test: examples/fmt_test.c liblogx.a
 	$(CC) $(CFLAGS) -o $@ $< liblogx.a $(LDFLAGS)
+
+# 포맷팅 비용 측정: lockfree_logger.c 의 static 함수를 직접 재려고 소스를 include 하므로 log_common.o 만 링크
+fmt_bench: examples/fmt_bench.c logger/lockfree_logger.c logger/log_common.o
+	$(CC) $(CFLAGS) -o $@ $< logger/log_common.o $(LDFLAGS)
 
 test: fmt_test bench
 	./fmt_test
@@ -34,6 +38,6 @@ tsan: clean bench
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(LIB_OBJ) liblogx.a example bench fmt_test *.log
+	rm -f $(LIB_OBJ) liblogx.a example bench fmt_test fmt_bench *.log
 
 .PHONY: all clean tsan test
