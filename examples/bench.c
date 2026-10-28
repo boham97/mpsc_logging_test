@@ -13,6 +13,7 @@
 #include "../logger/sync_logger.h"
 
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,7 @@ typedef struct {
     sync_logger *slg;
     double sum_ns;
     double max_ns;
+    uint32_t *lat; /* 호출별 지연 (ns), 백분위 계산용 */
 } worker_arg;
 
 static pthread_barrier_t start_barrier;
@@ -64,6 +66,7 @@ static void *worker(void *p)
         else
             SLOG_INFO(a->slg, "T%d #%d payload=%s", a->id, i, "the quick brown fox jumps over the lazy dog");
         double dt = now_ns() - t0;
+        a->lat[i] = dt < 4e9 ? (uint32_t)dt : UINT32_MAX;
         a->sum_ns += dt;
         if (dt > a->max_ns)
             a->max_ns = dt;
@@ -73,6 +76,37 @@ static void *worker(void *p)
         }
     }
     return NULL;
+}
+
+static int cmp_u32(const void *x, const void *y)
+{
+    uint32_t a = *(const uint32_t *)x, b = *(const uint32_t *)y;
+    return (a > b) - (a < b);
+}
+
+/* 모든 스레드의 호출 지연을 모아 백분위를 출력 */
+static void print_percentiles(worker_arg *args, int nthreads, int lines)
+{
+    size_t n = (size_t)nthreads * lines;
+    uint32_t *all = malloc(n * sizeof(*all));
+    for (int i = 0; i < nthreads; i++)
+        memcpy(all + (size_t)i * lines, args[i].lat, (size_t)lines * sizeof(*all));
+    qsort(all, n, sizeof(*all), cmp_u32);
+    static const double ps[] = {50, 90, 99, 99.9, 99.99};
+    printf("  percentiles:");
+    for (size_t k = 0; k < sizeof(ps) / sizeof(ps[0]); k++) {
+        uint32_t v = all[(size_t)(ps[k] / 100 * (double)(n - 1))];
+        if (v < 10000)
+            printf(" p%g %u ns,", ps[k], v);
+        else
+            printf(" p%g %.1f us,", ps[k], v / 1e3);
+    }
+    /* 10us 이상 걸린 호출 (선점·큐 가득 참·뮤텍스 대기 등으로 실제로 막힌 경우) */
+    size_t slow = 0;
+    for (size_t i = n; i > 0 && all[i - 1] >= 10000; i--)
+        slow++;
+    printf(" >=10us %zu calls (%.3f%%)\n", slow, 100.0 * (double)slow / (double)n);
+    free(all);
 }
 
 /* 파일을 읽어 각 스레드의 #번호가 0,1,2,... 순서로 빠짐없이 나오는지 확인 */
@@ -141,7 +175,7 @@ static int run(mode_t_ mode, int nthreads, int lines)
     pthread_barrier_init(&start_barrier, NULL, (unsigned)nthreads + 1);
 
     for (int i = 0; i < nthreads; i++) {
-        args[i] = (worker_arg){i, lines, mode, alg, lfg, slg, 0, 0};
+        args[i] = (worker_arg){i, lines, mode, alg, lfg, slg, 0, 0, malloc((size_t)lines * sizeof(uint32_t))};
         pthread_create(&th[i], NULL, worker, &args[i]);
     }
     pthread_barrier_wait(&start_barrier);
@@ -170,6 +204,9 @@ static int run(mode_t_ mode, int nthreads, int lines)
     printf("  callers done: %7.1f ms, all on disk: %7.1f ms, throughput: %.2f M lines/s\n",
            t_calls / 1e6, t_total / 1e6, n / (t_total / 1e9) / 1e6);
     printf("  call latency: avg %.0f ns, max %.1f us\n", sum / n, mx / 1e3);
+    print_percentiles(args, nthreads, lines);
+    for (int i = 0; i < nthreads; i++)
+        free(args[i].lat);
 
     pthread_barrier_destroy(&start_barrier);
     free(th);
