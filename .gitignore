@@ -3,3 +3,9 @@
 *.log
 /example
 /bench
+/fmt_test
+/fmt_bench
+/lf_drv
+perf.data*
+/lf_drv_snprintf
+/build/

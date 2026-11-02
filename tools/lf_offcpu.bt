@@ -1,0 +1,50 @@
+/*
+ * lf_drv 실행 중 스레드별로 "시스템 콜 안에 있던 시간"과 "CPU 밖에 있던 시간"을 나눈다.
+ *   - sched_yield: 큐가 가득 차서 호출자가 빈 슬롯을 기다림
+ *   - futex: 호출자의 wake / 로깅 스레드의 wait (메인 스레드의 pthread_join 도 여기 잡힌다)
+ *   - write: 로깅 스레드의 디스크 쓰기
+ *   - off-CPU: sched_switch 로 CPU 를 내준 시간
+ * CPU 위에서 무엇을 했는지는 보지 않는다 (그건 perf record -e cycles:u 로 본다).
+ * uprobe 는 호출마다 수 µs 를 더해 결과를 왜곡하므로 쓰지 않는다.
+ *
+ * 실행: sudo tools/run_bt.sh   (키 = TID, write 를 하는 TID 가 로깅 스레드)
+ */
+
+tracepoint:raw_syscalls:sys_enter /pid == cpid/
+{
+    @sc_start[tid] = nsecs;
+    @sc_id[tid] = args->id;
+}
+
+tracepoint:raw_syscalls:sys_exit /pid == cpid && @sc_start[tid]/
+{
+    $d = nsecs - @sc_start[tid];
+    $id = @sc_id[tid];
+    /* x86-64: 1=write 24=sched_yield 202=futex. 합계는 ns 로 더한다 (µs 로 자르면 짧은 호출이 0 이 됨) */
+    if ($id == 1)   { @write_ns[tid] = sum($d); @write_n[tid] = count(); @write_lat_us = hist($d / 1000); }
+    if ($id == 24)  { @yield_ns[tid] = sum($d); @yield_n[tid] = count(); }
+    if ($id == 202) { @futex_ns[tid] = sum($d); @futex_n[tid] = count(); @futex_lat_us = hist($d / 1000); }
+    delete(@sc_start[tid]);
+    delete(@sc_id[tid]);
+}
+
+tracepoint:sched:sched_switch /pid == cpid/
+{
+    @off_start[tid] = nsecs;
+    /* prev_state 0 = 실행 가능한데 CPU 를 내줌 (선점, 실제로 다른 스레드로 넘어간 sched_yield) */
+    if (args->prev_state == 0) { @preempt_n[tid] = count(); }
+}
+
+tracepoint:sched:sched_switch /@off_start[(uint64)args->next_pid]/
+{
+    $d = nsecs - @off_start[(uint64)args->next_pid];
+    @offcpu_ns[(uint64)args->next_pid] = sum($d);
+    if ($d > 10000) { @offcpu_over10us[(uint64)args->next_pid] = count(); }
+    delete(@off_start[(uint64)args->next_pid]);
+}
+
+END
+{
+    clear(@sc_start); clear(@sc_id); clear(@off_start);
+    printf("\n*_ns = 합계 ns, *_n = 횟수, 키 = TID (write 를 하는 TID 가 로깅 스레드)\n");
+}

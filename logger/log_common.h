@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <sys/types.h>
+#include <time.h>
 
 #define LOG_LINE_MAX 1024 /* 한 줄 최대 길이 (넘으면 잘림) */
 
@@ -18,6 +19,29 @@ typedef enum {
 } log_level;
 
 const char *log_level_name(log_level lv);
+
+/*
+ * 호출 스레드의 커널 TID (스레드별 캐싱).
+ * 매 로그마다 불리므로 인라인으로 TLS 만 읽고, 스레드의 첫 호출만 gettid 로 조회한다.
+ */
+extern _Thread_local int log_tid_cache;
+int log_current_tid_slow(void);
+
+static inline int log_current_tid(void)
+{
+    int tid = log_tid_cache;
+    if (__builtin_expect(tid == 0, 0))
+        tid = log_current_tid_slow();
+    return tid;
+}
+
+/*
+ * "2026-10-19 16:30:01.123456 [INFO ] 12345 main.c:42 | " 접두어만 out 에 쓴다.
+ * 시각/TID 를 인자로 받으므로 로그를 남긴 스레드가 아닌 곳(로깅 스레드)에서도 쓸 수 있다.
+ * 반환값: 쓴 바이트 수 (cap-1 이하)
+ */
+size_t log_format_prefix(char *out, size_t cap, log_level lv, const char *file, int line,
+                         const struct timespec *ts, int tid);
 
 /*
  * "2026-10-19 16:30:01.123456 [INFO ] 12345 main.c:42 | 메시지\n" 형태로 out에 쓴다.
