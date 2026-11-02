@@ -97,50 +97,27 @@ static size_t fmt_str(char *out, const char *s)
 
 /* ======================== 직접 변환으로 만든 render_record ======================== */
 
-/* log_format_prefix 와 같은 결과 (초 단위 시각 문자열 캐싱도 같음) */
-static size_t prefix_fast(char *out, size_t cap, log_level lv, const char *file, int line,
-                          const struct timespec *ts, int tid)
+/*
+ * 비교 기준: 직접 변환으로 바꾸기 전의 log_format_prefix (snprintf 한 번).
+ * 지금의 log_format_prefix 가 이것과 글자 단위로 같은지 check_correctness 에서 확인한다.
+ */
+static size_t prefix_snprintf(char *out, size_t cap, log_level lv, const char *file, int line,
+                              const struct timespec *ts, int tid)
 {
     static _Thread_local time_t cached_sec = -1;
     static _Thread_local char cached_time[32];
-    static _Thread_local size_t cached_len;
 
     if (ts->tv_sec != cached_sec) {
         struct tm tm;
         localtime_r(&ts->tv_sec, &tm);
-        cached_len = strftime(cached_time, sizeof(cached_time), "%Y-%m-%d %H:%M:%S", &tm);
+        strftime(cached_time, sizeof(cached_time), "%Y-%m-%d %H:%M:%S", &tm);
         cached_sec = ts->tv_sec;
     }
     const char *base = strrchr(file, '/');
     base = base ? base + 1 : file;
-    size_t blen = strlen(base);
-    if (cached_len + blen + 64 > cap) /* 드문 경우 (아주 긴 파일 이름)는 원래 함수로 */
-        return log_format_prefix(out, cap, lv, file, line, ts, tid);
-
-    char *p = out;
-    memcpy(p, cached_time, cached_len);
-    p += cached_len;
-    *p++ = '.';
-    unsigned us = (unsigned)(ts->tv_nsec / 1000); /* %06ld */
-    memcpy(p, digits2 + (us / 10000) * 2, 2);
-    memcpy(p + 2, digits2 + (us / 100 % 100) * 2, 2);
-    memcpy(p + 4, digits2 + (us % 100) * 2, 2);
-    p += 6;
-    memcpy(p, " [", 2);
-    p += 2;
-    memcpy(p, log_level_name(lv), 5);
-    p += 5;
-    memcpy(p, "] ", 2);
-    p += 2;
-    p += fmt_i64(p, tid);
-    *p++ = ' ';
-    memcpy(p, base, blen);
-    p += blen;
-    *p++ = ':';
-    p += fmt_i64(p, line);
-    memcpy(p, " | ", 3);
-    p += 3;
-    return (size_t)(p - out);
+    int n = snprintf_p(out, cap, "%s.%06ld [%s] %d %s:%d | ",
+                       cached_time, ts->tv_nsec / 1000, log_level_name(lv), tid, base, line);
+    return (n < 0) ? 0 : ((size_t)n >= cap ? cap - 1 : (size_t)n);
 }
 
 /* 플래그/폭/정밀도 없는 %d %i %u %x %s 만 있는가 (실제로 넣을 때는 호출 위치별로 캐싱하면 됨) */
@@ -305,7 +282,7 @@ static size_t render_record_with(char *out, size_t cap, const char *data,
     struct timespec ts; clock_to_timespec(&bench_clock, h.stamp, &ts);
 
     outbuf o = {out, 0, cap - 1};
-    o.len = prefix_fast(out, o.cap, (log_level)h.level, h.file, h.line, &ts, h.tid);
+    o.len = log_format_prefix(out, o.cap, (log_level)h.level, h.file, h.line, &ts, h.tid);
     arg_reader r = {data + sizeof(h), h.nargs};
     msg(&o, h.fmt, &r);
     out[o.len++] = '\n';
@@ -384,9 +361,49 @@ static void expect_same(const char *what, const char *got, size_t n, const char 
     }
 }
 
+/* log_format_prefix(직접 변환)가 snprintf 판과 같은지: 레벨, 정수 경계, nsec 경계, 파일 이름, 작은 cap(잘림) */
+static void check_prefix(void)
+{
+    static char longname[400];
+    memset(longname, 'x', sizeof(longname) - 3);
+    memcpy(longname + sizeof(longname) - 3, ".c", 3);
+    const char *files[] = {"main.c", "/a/b/c.c", "dir/", "", "noslash", longname};
+    const int ints[] = {0, 1, -1, 9, 10, 99, 100, 12345, INT_MAX, INT_MIN};
+    const long nsecs[] = {0, 999, 1000, 123456789, 999999999, -1, 1000000000};
+    const time_t secs[] = {1761900000, 1761900001, 0};
+    const size_t caps[] = {1, 8, 20, 40, 64, 70, 100, 1024};
+    char want[1100], got[1100];
+    long checked = 0;
+
+    for (size_t si = 0; si < sizeof(secs) / sizeof(secs[0]); si++)
+    for (size_t ni = 0; ni < sizeof(nsecs) / sizeof(nsecs[0]); ni++)
+    for (int lv = 0; lv <= LOG_FATAL + 1; lv++)
+    for (size_t fi = 0; fi < sizeof(files) / sizeof(files[0]); fi++)
+    for (size_t ti = 0; ti < sizeof(ints) / sizeof(ints[0]); ti++)
+    for (size_t ci = 0; ci < sizeof(caps) / sizeof(caps[0]); ci++) {
+        struct timespec ts = {secs[si], nsecs[ni]};
+        int v = ints[ti], line = ints[(ti + 3) % (sizeof(ints) / sizeof(ints[0]))];
+        size_t cap = caps[ci];
+        memset(want, '#', sizeof(want));
+        memset(got, '#', sizeof(got));
+        size_t nw = prefix_snprintf(want, cap, (log_level)lv, files[fi], line, &ts, v);
+        size_t ng = log_format_prefix(got, cap, (log_level)lv, files[fi], line, &ts, v);
+        /* 길이, 내용, NUL, 그 뒤를 건드리지 않았는지까지 같아야 한다 */
+        if (ng != nw || memcmp(got, want, cap) != 0 || memcmp(got + cap, want + cap, 8) != 0) {
+            if (fails++ < 10)
+                printf("MISMATCH prefix lv=%d file=%.20s tid=%d line=%d nsec=%ld cap=%zu:\n"
+                       "  got  %zu \"%.*s\"\n  want %zu \"%.*s\"\n",
+                       lv, files[fi], v, line, nsecs[ni], cap, ng, (int)ng, got, nw, (int)nw, want);
+        }
+        checked++;
+    }
+    printf("접두어: %ld 조합이 snprintf 판과 같음 확인\n", checked - fails);
+}
+
 static void check_correctness(void)
 {
     char a[64], b[1100], c[1100];
+    check_prefix();
     static const long long edge[] = {0, 1, -1, 9, 10, 99, 100, INT_MAX, INT_MIN, LLONG_MAX, LLONG_MIN};
     for (size_t i = 0; i < sizeof(edge) / sizeof(edge[0]); i++) {
         snprintf(b, sizeof(b), "%lld", edge[i]);
@@ -521,11 +538,11 @@ int main(int argc, char **argv)
         printf("  %s\n", lines[l].name);
         double ps = BENCH(rec_hdr h; memcpy(&h, lines[l].rec[k], sizeof(h));
                           struct timespec ts; clock_to_timespec(&bench_clock, h.stamp, &ts);
-                          acc += log_format_prefix(buf, sizeof(buf), (log_level)h.level, h.file, h.line, &ts, h.tid));
+                          acc += prefix_snprintf(buf, sizeof(buf), (log_level)h.level, h.file, h.line, &ts, h.tid));
         double pf = BENCH(rec_hdr h; memcpy(&h, lines[l].rec[k], sizeof(h));
                           struct timespec ts; clock_to_timespec(&bench_clock, h.stamp, &ts);
-                          acc += prefix_fast(buf, sizeof(buf), (log_level)h.level, h.file, h.line, &ts, h.tid));
-        printf("  %-44s %8.1f %8.1f %8s %7.1fx\n", "  접두어 (시각.us [레벨] TID 파일:줄 | )", ps, pf, "-", ps / pf);
+                          acc += log_format_prefix(buf, sizeof(buf), (log_level)h.level, h.file, h.line, &ts, h.tid));
+        printf("  %-44s %8.1f %8.1f %8s %7.1fx\n", "  접두어: snprintf(기존) → 현재 (직접 변환)", ps, pf, "-", ps / pf);
         double ms = MSG_BENCH(render_message);
         double mf = MSG_BENCH(render_message_fast);
         double mc = MSG_BENCH(render_message_cached);
