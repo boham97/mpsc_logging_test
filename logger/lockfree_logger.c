@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "lockfree_logger.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/futex.h>
@@ -27,6 +28,155 @@
 #define cpu_relax() ((void)0)
 #endif
 
+/* ======================== 시각: TSC ======================== */
+
+/*
+ * 호출 스레드는 시각을 TSC 원값으로만 남기고(rdtsc ≈ 8ns, clock_gettime ≈ 22ns),
+ * 실제 시각으로 바꾸는 일은 로깅 스레드가 한다.
+ * TSC 를 믿을 수 없으면(x86-64 가 아님, invariant TSC 없음, 커널 clocksource 가 tsc 가 아님)
+ * 또는 -DLF_NO_TSC 로 빌드하면 CLOCK_REALTIME 을 ns 로 저장한다.
+ */
+#if defined(__x86_64__) && !defined(LF_NO_TSC)
+#include <cpuid.h>
+#include <x86intrin.h>
+#define LF_HAVE_TSC 1
+#else
+#define LF_HAVE_TSC 0
+#endif
+
+#define CLOCK_RESYNC_NS 1000000000LL /* 로깅 스레드가 이 간격마다 기준점을 다시 잡는다 */
+
+/* 로깅 스레드만 쓰는 기준점: 시각 = base_ns + (stamp - base_tsc) × ns_per_tick */
+typedef struct {
+    uint64_t base_tsc;
+    int64_t base_ns;
+    double ns_per_tick;
+    int64_t resync_ticks;
+} lf_clock;
+
+static int64_t realtime_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+#if LF_HAVE_TSC
+/* 프로세스에서 한 번 정해짐 (pthread_once). 호출 스레드는 lflog_open 이 끝난 뒤에만 읽는다 */
+static int use_tsc;
+static double tsc_ns_per_tick;
+
+/* (TSC, 실제 시각) 한 쌍. clock_gettime 앞뒤 TSC 의 가운데를 쓰고, 다섯 번 중 간격이 가장 짧은 것 */
+static void tsc_pair(uint64_t *tsc, int64_t *ns)
+{
+    uint64_t best = UINT64_MAX, best_tsc = 0;
+    int64_t best_ns = 0;
+    for (int i = 0; i < 5; i++) {
+        uint64_t t0 = __rdtsc();
+        int64_t n = realtime_ns();
+        uint64_t t1 = __rdtsc();
+        if (t1 - t0 < best) {
+            best = t1 - t0;
+            best_tsc = t0 + (t1 - t0) / 2;
+            best_ns = n;
+        }
+    }
+    *tsc = best_tsc;
+    *ns = best_ns;
+}
+
+static int tsc_reliable(void)
+{
+    unsigned a, b, c, d;
+    if (!__get_cpuid(0x80000007, &a, &b, &c, &d) || !(d & (1u << 8))) /* invariant TSC */
+        return 0;
+    /* 커널이 TSC 를 불안정하다고 보고 다른 clocksource 로 바꿨으면 쓰지 않는다 */
+    char cs[32] = "";
+    FILE *fp = fopen("/sys/devices/system/clocksource/clocksource0/current_clocksource", "r");
+    if (fp) {
+        if (!fgets(cs, sizeof(cs), fp))
+            cs[0] = '\0';
+        fclose(fp);
+    }
+    return strcmp(cs, "tsc\n") == 0;
+}
+
+/* 주파수 첫 보정: 10ms 떨어진 두 쌍 (오차 수십 ppm). 이후는 로깅 스레드가 1초마다 다시 잰다 */
+static void tsc_init(void)
+{
+    if (!tsc_reliable())
+        return;
+    uint64_t t0, t1;
+    int64_t n0, n1;
+    tsc_pair(&t0, &n0);
+    struct timespec q = {0, 10 * 1000 * 1000};
+    nanosleep(&q, NULL);
+    tsc_pair(&t1, &n1);
+    if (t1 <= t0 || n1 <= n0)
+        return;
+    tsc_ns_per_tick = (double)(n1 - n0) / (double)(t1 - t0);
+    use_tsc = 1;
+}
+
+static pthread_once_t tsc_once = PTHREAD_ONCE_INIT;
+
+static void clock_resync(lf_clock *ck)
+{
+    uint64_t t;
+    int64_t n;
+    tsc_pair(&t, &n);
+    /*
+     * 지난 기준점부터의 실제 비율로 주파수를 다시 잰다 (NTP 보정 속도도 따라감).
+     * 시계가 바뀌었으면(settimeofday 등) 비율이 엉뚱하게 나오므로 기준점만 옮긴다.
+     */
+    double r = (double)(n - ck->base_ns) / (double)(t - ck->base_tsc);
+    if (r > tsc_ns_per_tick * 0.999 && r < tsc_ns_per_tick * 1.001)
+        ck->ns_per_tick = r;
+    ck->base_tsc = t;
+    ck->base_ns = n;
+}
+#endif
+
+static void clock_init(lf_clock *ck)
+{
+    memset(ck, 0, sizeof(*ck));
+#if LF_HAVE_TSC
+    pthread_once(&tsc_once, tsc_init);
+    if (use_tsc) {
+        tsc_pair(&ck->base_tsc, &ck->base_ns);
+        ck->ns_per_tick = tsc_ns_per_tick;
+        ck->resync_ticks = (int64_t)((double)CLOCK_RESYNC_NS / tsc_ns_per_tick);
+    }
+#endif
+}
+
+/* 호출 스레드가 남기는 시각 */
+static inline uint64_t clock_stamp(void)
+{
+#if LF_HAVE_TSC
+    if (use_tsc)
+        return __rdtsc();
+#endif
+    return (uint64_t)realtime_ns();
+}
+
+/* 로깅 스레드: 남겨진 시각 → 실제 시각 */
+static void clock_to_timespec(lf_clock *ck, uint64_t stamp, struct timespec *ts)
+{
+    int64_t ns = (int64_t)stamp;
+#if LF_HAVE_TSC
+    if (use_tsc) {
+        if ((int64_t)(stamp - ck->base_tsc) > ck->resync_ticks)
+            clock_resync(ck);
+        ns = ck->base_ns + (int64_t)((double)(int64_t)(stamp - ck->base_tsc) * ck->ns_per_tick);
+    }
+#else
+    (void)ck;
+#endif
+    ts->tv_sec = (time_t)(ns / 1000000000LL);
+    ts->tv_nsec = (long)(ns % 1000000000LL);
+}
+
 enum { CELL_TEXT = 0, CELL_RECORD = 1 };
 
 typedef struct {
@@ -42,11 +192,13 @@ struct lf_logger {
 
     /* 소비자만 쓰는 변수 */
     _Alignas(CACHE_LINE) size_t dequeue_pos;
+    lf_clock clock;              /* 레코드의 시각 변환용 */
     _Atomic size_t written_pos;  /* 디스크까지 쓴 위치 (flush 대기용) */
 
     /* 생산자가 읽고 소비자가 쓰는 변수 */
     _Alignas(CACHE_LINE) _Atomic int sleeping;  /* futex 워드 */
     _Atomic int stop;
+    int busy_poll;               /* 1: 소비자가 잠들지 않음 (sleeping 은 항상 0) */
 
     _Alignas(CACHE_LINE) _Atomic unsigned long dropped;
     _Atomic int min_level;
@@ -116,8 +268,7 @@ static int try_enqueue(lf_logger *lg, const char *buf, size_t n, uint32_t kind)
 typedef struct {
     const char *fmt;   /* 문자열 리터럴 → 정적 수명 */
     const char *file;  /* __FILE__ → 정적 수명 */
-    int64_t sec;
-    int32_t nsec;
+    uint64_t stamp;    /* clock_stamp(): TSC 원값 또는 CLOCK_REALTIME ns */
     int32_t line;
     int32_t tid;
     uint8_t level;
@@ -298,9 +449,7 @@ static const short *get_plan(const char *fmt, const lf_arg *args, int nargs,
 static size_t encode_record(char *buf, size_t cap, log_level lv, const char *file, int line,
                             const char *fmt, const lf_arg *args, int nargs, lf_fmt_cache *cache)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    rec_hdr h = {fmt, file, ts.tv_sec, (int32_t)ts.tv_nsec, line, log_current_tid(), (uint8_t)lv, 0};
+    rec_hdr h = {fmt, file, clock_stamp(), line, log_current_tid(), (uint8_t)lv, 0};
 
     if (nargs > LF_MAX_ARGS)
         nargs = LF_MAX_ARGS;
@@ -539,11 +688,12 @@ static void render_message(outbuf *o, const char *fmt, arg_reader *r)
 }
 
 /* 레코드 → 완성된 한 줄. 반환값: 쓴 바이트 수 ('\n' 포함, cap-1 이하) */
-static size_t render_record(char *out, size_t cap, const char *data)
+static size_t render_record(char *out, size_t cap, const char *data, lf_clock *ck)
 {
     rec_hdr h;
     memcpy(&h, data, sizeof(h));
-    struct timespec ts = {(time_t)h.sec, h.nsec};
+    struct timespec ts;
+    clock_to_timespec(ck, h.stamp, &ts);
 
     outbuf o = {out, 0, cap - 1}; /* 마지막 '\n' 자리 확보 */
     o.len = log_format_prefix(out, o.cap, (log_level)h.level, h.file, h.line, &ts, h.tid);
@@ -567,7 +717,7 @@ static int try_dequeue(lf_logger *lg, char *out, size_t *out_len)
         *out_len += cell->len;
     } else {
         /* 포맷팅은 여기서 (호출자는 이미 다른 일 하는 중) */
-        *out_len += render_record(out + *out_len, LOG_LINE_MAX, cell->data);
+        *out_len += render_record(out + *out_len, LOG_LINE_MAX, cell->data, &lg->clock);
     }
     /* 슬롯 반납: 한 바퀴 뒤의 생산자(pos + capacity)가 쓸 수 있게 */
     atomic_store_explicit(&cell->seq, pos + lg->mask + 1, memory_order_release);
@@ -633,7 +783,7 @@ static void *consumer_main(void *arg)
         int spun;
         for (spun = 0; spun < SPIN_BEFORE_SLEEP && !queue_has_data(lg); spun++)
             cpu_relax();
-        if (spun < SPIN_BEFORE_SLEEP)
+        if (spun < SPIN_BEFORE_SLEEP || lg->busy_poll)
             continue;
 
         /* 5) 잠들기: sleeping=1 → fence → 큐 재확인 → futex_wait */
@@ -663,7 +813,7 @@ static size_t round_up_pow2(size_t v)
 
 lf_logger *lflog_open(const char *path, const lf_logger_opts *opts)
 {
-    lf_logger_opts o = opts ? *opts : (lf_logger_opts){LOG_INFO, 16384, 0};
+    lf_logger_opts o = opts ? *opts : (lf_logger_opts){.min_level = LOG_INFO, .capacity = 16384};
     size_t cap = round_up_pow2(o.capacity < 2 ? 2 : o.capacity);
 
     lf_logger *lg = aligned_alloc(CACHE_LINE, sizeof(*lg));
@@ -678,12 +828,34 @@ lf_logger *lflog_open(const char *path, const lf_logger_opts *opts)
 
     lg->mask = cap - 1;
     lg->drop_on_full = o.drop_on_full;
+    lg->busy_poll = o.busy_poll;
     atomic_init(&lg->min_level, o.min_level);
     for (size_t i = 0; i < cap; i++)
         atomic_init(&lg->cells[i].seq, i);
+    clock_init(&lg->clock);
 
-    if (pthread_create(&lg->thread, NULL, consumer_main, lg) != 0)
+    /* 고정은 스레드를 만들 때 한다 (처음부터 그 CPU 에서만 돎) */
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0)
         goto fail;
+    int err = 0;
+    if (o.pin_consumer) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (o.consumer_cpu < 0 || o.consumer_cpu >= CPU_SETSIZE)
+            err = EINVAL;
+        else {
+            CPU_SET(o.consumer_cpu, &set);
+            err = pthread_attr_setaffinity_np(&attr, sizeof(set), &set);
+        }
+    }
+    if (!err)
+        err = pthread_create(&lg->thread, &attr, consumer_main, lg);
+    pthread_attr_destroy(&attr);
+    if (err) {
+        errno = err;
+        goto fail;
+    }
     return lg;
 
 fail:

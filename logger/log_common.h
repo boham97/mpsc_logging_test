@@ -20,8 +20,20 @@ typedef enum {
 
 const char *log_level_name(log_level lv);
 
-/* 호출 스레드의 커널 TID (스레드별 캐싱) */
-int log_current_tid(void);
+/*
+ * 호출 스레드의 커널 TID (스레드별 캐싱).
+ * 매 로그마다 불리므로 인라인으로 TLS 만 읽고, 스레드의 첫 호출만 gettid 로 조회한다.
+ */
+extern _Thread_local int log_tid_cache;
+int log_current_tid_slow(void);
+
+static inline int log_current_tid(void)
+{
+    int tid = log_tid_cache;
+    if (__builtin_expect(tid == 0, 0))
+        tid = log_current_tid_slow();
+    return tid;
+}
 
 /*
  * "2026-10-19 16:30:01.123456 [INFO ] 12345 main.c:42 | " 접두어만 out 에 쓴다.

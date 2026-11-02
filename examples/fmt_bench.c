@@ -20,6 +20,7 @@
 static int (*volatile snprintf_p)(char *, size_t, const char *, ...) = snprintf;
 
 static volatile size_t sink; /* 결과를 써서 계산이 지워지지 않게 */
+static lf_clock bench_clock; /* 레코드 시각 변환 (로깅 스레드의 lg->clock 역할) */
 
 /* ======================== 직접 변환 ======================== */
 
@@ -301,7 +302,7 @@ static size_t render_record_with(char *out, size_t cap, const char *data,
 {
     rec_hdr h;
     memcpy(&h, data, sizeof(h));
-    struct timespec ts = {(time_t)h.sec, h.nsec};
+    struct timespec ts; clock_to_timespec(&bench_clock, h.stamp, &ts);
 
     outbuf o = {out, 0, cap - 1};
     o.len = prefix_fast(out, o.cap, (log_level)h.level, h.file, h.line, &ts, h.tid);
@@ -407,7 +408,7 @@ static void check_correctness(void)
         snprintf(b, sizeof(b), "%5d", ival[k] % 100000);
         expect_same("%5d", a, fmt_i64_width(a, ival[k] % 100000, 5), b);
         for (int l = 0; l < 2; l++) {
-            size_t nb = render_record(b, LOG_LINE_MAX, lines[l].rec[k]);
+            size_t nb = render_record(b, LOG_LINE_MAX, lines[l].rec[k], &bench_clock);
             b[nb] = '\0';
             expect_same("render_record_fast", c, render_record_fast(c, LOG_LINE_MAX, lines[l].rec[k]), b);
             expect_same("render_record_cached", c, render_record_cached(c, LOG_LINE_MAX, lines[l].rec[k]), b);
@@ -425,7 +426,7 @@ static void check_correctness(void)
     };
     for (size_t i = 0; i < sizeof(more) / sizeof(more[0]); i++) {
         encode_record(rec, LOG_LINE_MAX, LOG_INFO, __FILE__, __LINE__, more[i].fmt, more[i].args, more[i].n, NULL);
-        size_t nb = render_record(b, LOG_LINE_MAX, rec);
+        size_t nb = render_record(b, LOG_LINE_MAX, rec, &bench_clock);
         b[nb] = '\0';
         for (int rep = 0; rep < 2; rep++) { /* 두 번째는 캐시된 해석 결과 사용 */
             expect_same(more[i].fmt, c, render_record_fast(c, LOG_LINE_MAX, rec), b);
@@ -477,6 +478,7 @@ int main(int argc, char **argv)
 {
     iters = argc > 1 ? atol(argv[1]) : 2000000;
     init_digits();
+    clock_init(&bench_clock);
     for (int k = 0; k < NVALS; k++) {
         ival[k] = (int)rand_digits(9) * ((xorshift() & 1) ? 1 : -1);
         llval[k] = (long long)rand_digits(18) * ((xorshift() & 1) ? 1 : -1);
@@ -518,17 +520,17 @@ int main(int argc, char **argv)
     for (int l = 0; l < 2; l++) {
         printf("  %s\n", lines[l].name);
         double ps = BENCH(rec_hdr h; memcpy(&h, lines[l].rec[k], sizeof(h));
-                          struct timespec ts = {(time_t)h.sec, h.nsec};
+                          struct timespec ts; clock_to_timespec(&bench_clock, h.stamp, &ts);
                           acc += log_format_prefix(buf, sizeof(buf), (log_level)h.level, h.file, h.line, &ts, h.tid));
         double pf = BENCH(rec_hdr h; memcpy(&h, lines[l].rec[k], sizeof(h));
-                          struct timespec ts = {(time_t)h.sec, h.nsec};
+                          struct timespec ts; clock_to_timespec(&bench_clock, h.stamp, &ts);
                           acc += prefix_fast(buf, sizeof(buf), (log_level)h.level, h.file, h.line, &ts, h.tid));
         printf("  %-44s %8.1f %8.1f %8s %7.1fx\n", "  접두어 (시각.us [레벨] TID 파일:줄 | )", ps, pf, "-", ps / pf);
         double ms = MSG_BENCH(render_message);
         double mf = MSG_BENCH(render_message_fast);
         double mc = MSG_BENCH(render_message_cached);
         printf("  %-44s %8.1f %8.1f %8.1f %7.1fx\n", "  메시지", ms, mf, mc, ms / mc);
-        double ts_ = BENCH(acc += render_record(buf, LOG_LINE_MAX, lines[l].rec[k]));
+        double ts_ = BENCH(acc += render_record(buf, LOG_LINE_MAX, lines[l].rec[k], &bench_clock));
         double tf = BENCH(acc += render_record_fast(buf, LOG_LINE_MAX, lines[l].rec[k]));
         double tc = BENCH(acc += render_record_cached(buf, LOG_LINE_MAX, lines[l].rec[k]));
         printf("  %-44s %8.1f %8.1f %8.1f %7.1fx\n", "  합계 (render_record)", ts_, tf, tc, ts_ / tc);

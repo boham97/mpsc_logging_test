@@ -46,9 +46,17 @@ typedef struct {
     log_level min_level;
     size_t capacity;   /* 슬롯 수 (2의 거듭제곱으로 올림). 메모리 = capacity * ~1KB */
     int drop_on_full;  /* 1: 가득 차면 버림, 0: 빌 때까지 재시도 */
+    /*
+     * 1: 로깅 스레드가 잠들지 않고 큐를 계속 폴링한다. 호출자가 futex_wake 를 할 일이 없어져
+     *    부하가 낮을 때의 꼬리 지연이 줄지만, 로그가 없어도 코어 하나를 100% 쓴다.
+     *    작업 스레드와 코어를 다투지 않도록 pin_consumer 로 전용 코어에 고정해서 쓴다.
+     */
+    int busy_poll;
+    int pin_consumer;  /* 1: 로깅 스레드를 consumer_cpu 에 고정 (CPU 가 없으면 lflog_open 실패) */
+    int consumer_cpu;
 } lf_logger_opts;
 
-/* opts == NULL 이면 기본값 (INFO, 16384 슬롯 ≈ 17MB, 재시도) */
+/* opts == NULL 이면 기본값 (INFO, 16384 슬롯 ≈ 17MB, 재시도, futex 로 잠듦, 고정 안 함) */
 lf_logger *lflog_open(const char *path, const lf_logger_opts *opts);
 
 /* 남은 로그를 모두 쓰고 스레드 종료 후 해제 */

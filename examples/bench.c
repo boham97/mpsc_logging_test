@@ -3,9 +3,10 @@
  *  1) 처리량 / 호출 지연시간(평균, 최대)을 재고
  *  2) 결과 파일을 다시 읽어 줄 유실·섞임·스레드별 순서 뒤바뀜이 없는지 검증한다.
  *
- * 사용법: ./bench [threads=8] [lines_per_thread=200000] [burst=0]
+ * 사용법: ./bench [threads=8] [lines_per_thread=200000] [burst=0] [busy_cpu=-1]
  *   burst > 0 이면 burst 줄마다 2ms 쉰다 (평소엔 조용하다가 몰아서 찍는 상황).
  *   이때는 처리량보다 호출 지연시간을 보면 된다.
+ *   busy_cpu >= 0 이면 락프리 로거의 로깅 스레드가 잠들지 않고 폴링하며 그 CPU 에 고정된다.
  */
 #define _GNU_SOURCE
 #include "../logger/async_logger.h"
@@ -43,6 +44,7 @@ typedef struct {
 
 static pthread_barrier_t start_barrier;
 static int burst;
+static int busy_cpu = -1;
 
 static double now_ns(void)
 {
@@ -160,7 +162,8 @@ static int run(mode_t_ mode, int nthreads, int lines)
         async_logger_opts o = {LOG_INFO, 8u << 20, 100, 0 /* 대기: 유실 없음 */};
         alg = alog_open(path, &o);
     } else if (mode == MODE_LOCKFREE || mode == MODE_LOCKFREE_TEXT) {
-        lf_logger_opts o = {LOG_INFO, 16384, 0 /* 재시도: 유실 없음 */};
+        lf_logger_opts o = {LOG_INFO, 16384, 0 /* 재시도: 유실 없음 */,
+                            busy_cpu >= 0, busy_cpu >= 0, busy_cpu};
         lfg = lflog_open(path, &o);
     } else {
         slg = slog_open(path, LOG_INFO, mode == MODE_SYNC_BUFFERED ? 64 * 1024 : 0);
@@ -219,8 +222,9 @@ int main(int argc, char **argv)
     int nthreads = argc > 1 ? atoi(argv[1]) : 8;
     int lines = argc > 2 ? atoi(argv[2]) : 200000;
     burst = argc > 3 ? atoi(argv[3]) : 0;
-    printf("threads=%d, lines/thread=%d, total=%ld, burst=%d\n\n", nthreads, lines,
-           (long)nthreads * lines, burst);
+    busy_cpu = argc > 4 ? atoi(argv[4]) : -1;
+    printf("threads=%d, lines/thread=%d, total=%ld, burst=%d, busy_cpu=%d\n\n", nthreads, lines,
+           (long)nthreads * lines, burst, busy_cpu);
 
     int rc = 0;
     rc |= run(MODE_ASYNC, nthreads, lines);

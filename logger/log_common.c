@@ -17,12 +17,12 @@ const char *log_level_name(log_level lv)
 }
 
 /* 커널 스레드 ID는 스레드마다 한 번만 조회 */
-int log_current_tid(void)
+_Thread_local int log_tid_cache = 0;
+
+int log_current_tid_slow(void)
 {
-    static _Thread_local pid_t tid = 0;
-    if (tid == 0)
-        tid = (pid_t)syscall(SYS_gettid);
-    return (int)tid;
+    log_tid_cache = (int)syscall(SYS_gettid);
+    return log_tid_cache;
 }
 
 static const char *base_name(const char *path)
