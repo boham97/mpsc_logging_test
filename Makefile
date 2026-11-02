@@ -6,7 +6,7 @@ CFLAGS  += -pthread
 LIB_SRC = logger/log_common.c logger/async_logger.c logger/lockfree_logger.c logger/sync_logger.c
 LIB_OBJ = $(LIB_SRC:.c=.o)
 
-all: liblogx.a example bench fmt_test fmt_bench
+all: liblogx.a example bench fmt_test fmt_bench lf_drv
 
 liblogx.a: $(LIB_OBJ)
 	ar rcs $@ $^
@@ -15,6 +15,10 @@ example: examples/example.c liblogx.a
 	$(CC) $(CFLAGS) -o $@ $< liblogx.a $(LDFLAGS)
 
 bench: examples/bench.c liblogx.a
+	$(CC) $(CFLAGS) -o $@ $< liblogx.a $(LDFLAGS)
+
+# 프로파일용: LFLOG 만 돌린다 (perf, tools/run_bt.sh)
+lf_drv: examples/lf_drv.c liblogx.a
 	$(CC) $(CFLAGS) -o $@ $< liblogx.a $(LDFLAGS)
 
 fmt_test: examples/fmt_test.c liblogx.a
@@ -38,6 +42,6 @@ tsan: clean bench
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(LIB_OBJ) liblogx.a example bench fmt_test fmt_bench *.log
+	rm -f $(LIB_OBJ) liblogx.a example bench fmt_test fmt_bench lf_drv *.log bt_*.txt
 
 .PHONY: all clean tsan test

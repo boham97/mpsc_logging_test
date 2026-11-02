@@ -5,3 +5,6 @@
 /bench
 /fmt_test
 /fmt_bench
+/lf_drv
+bt_*.txt
+perf.data*
