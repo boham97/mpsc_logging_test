@@ -7,3 +7,5 @@
 /fmt_bench
 /lf_drv
 perf.data*
+/lf_drv_snprintf
+/build/

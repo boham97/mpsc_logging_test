@@ -21,6 +21,12 @@ bench: examples/bench.c liblogx.a
 lf_drv: examples/lf_drv.c liblogx.a
 	$(CC) $(CFLAGS) -o $@ $< liblogx.a $(LDFLAGS)
 
+# 비교용: 접두어 직접 변환 전(97bef09)의 log_common.c 로 만든 lf_drv (tools/run_bt_cas.sh)
+lf_drv_snprintf: examples/lf_drv.c logger/lockfree_logger.c logger/log_common.h
+	mkdir -p build/snprintf
+	git show 97bef09:logger/log_common.c > build/snprintf/log_common.c
+	$(CC) $(CFLAGS) -Ilogger -o $@ $< logger/lockfree_logger.c build/snprintf/log_common.c $(LDFLAGS)
+
 fmt_test: examples/fmt_test.c liblogx.a
 	$(CC) $(CFLAGS) -o $@ $< liblogx.a $(LDFLAGS)
 
@@ -51,6 +57,7 @@ tsan: clean bench
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(LIB_OBJ) liblogx.a example bench fmt_test fmt_bench lf_drv *.log
+	rm -f $(LIB_OBJ) liblogx.a example bench fmt_test fmt_bench lf_drv lf_drv_snprintf *.log
+	rm -rf build
 
 .PHONY: all clean tsan test results

@@ -44,10 +44,11 @@ examples/
   bench.c               처리량/호출 지연(평균·백분위) 측정, 결과 파일 정합성 검증
   fmt_test.c            지연 포맷팅 vs snprintf 비교 테스트
   fmt_bench.c           로깅 스레드 포맷팅 비용 측정 (snprintf vs 직접 변환)
-  lf_drv.c              LFLOG 만 돌리는 프로파일용 드라이버 (perf, bpftrace)
+  lf_drv.c              락프리 로거만 돌리는 프로파일용 드라이버 (LFLOG / LFLOG_TEXT, perf, bpftrace)
 tools/
   lf_offcpu.bt          bpftrace: 스레드별 시스템 콜·off-CPU 시간
   run_bt.sh             lf_drv 두 조건으로 lf_offcpu.bt 실행 (sudo, 결과는 results/)
+  lf_cas.bt, run_bt_cas.sh  LFLOG_TEXT 슬롯 번호 CAS 시도를 uprobe 로 셈, 접두어 변경 전후 비교 (sudo)
   save_result.sh        명령을 실행하고 결과를 results/<날짜>_<이름>.md 로 저장
 results/                테스트·측정 결과 원본 (README.md 에 목록과 규칙)
 Makefile
@@ -427,7 +428,7 @@ TID는 스레드마다 한 번만 `gettid`로 받으므로, 인자로 넘겨도 
 
 ### 접두어 직접 변환 적용 전후 (`bench`)
 
-`log_format_prefix`의 `snprintf`를 직접 변환으로 바꾼 전후. 바꾸기 전(커밋 `97bef09`)과 후를 번갈아 3번씩 돌린 범위다. 모든 실행에서 결과 파일 검증을 통과했다. 원본: [bench](results/2026-11-02_154000_prefix_direct.md), [경쟁 계측](results/2026-11-02_154600_contention.md).
+`log_format_prefix`의 `snprintf`를 직접 변환으로 바꾼 전후. 바꾸기 전(커밋 `97bef09`)과 후를 번갈아 3번씩 돌린 범위다. 모든 실행에서 결과 파일 검증을 통과했다. 원본: [bench](results/2026-11-02_154000_prefix_direct.md), [경쟁 계측](results/2026-11-02_154600_contention.md), [bpftrace CAS](results/2026-11-02_160642_bpf_cas.md).
 
 **`LFLOG` (로깅 스레드가 접두어를 만듦)**
 
@@ -454,7 +455,7 @@ TID는 스레드마다 한 번만 `gettid`로 받으므로, 인자로 넘겨도 
 - 8 스레드 버스트는 이제 로깅 스레드가 넣는 속도를 따라잡아(약 350만 줄/s) 큐가 차지 않는다. 그래서 꼬리 지연이 1 스레드 수준으로 내려왔다.
 - 쉬지 않고 쓸 때 `LFLOG`의 p99와 p99.99는 그대로다. 여전히 큐가 차서 기다리는 호출이 있다. 남은 병목은 메시지 포맷팅(`vsnprintf`와 포맷 문자열 해석)이다.
 - 호출 스레드가 포맷팅하는 모드는 p50이 100~200ns 줄었다.
-- 나빠진 것도 있다. 쉬지 않고 쓸 때 `LFLOG_TEXT`의 p99가 0.9~1.0 → 1.3~1.5µs로 늘었다. 계측해 보니 슬롯 번호 CAS 실패가 호출당 0.9 → 2.5회로 늘었다. 호출자가 접두어를 빨리 만들어 같은 시간에 `enqueue_pos`를 더 자주 두드리기 때문이다(큐는 한 번도 차지 않음). async의 10µs 이상 비율 차이(1.3~1.5 → 1.5~1.6%)는 같은 계측에서 뮤텍스 경쟁이 그대로(호출의 44~47%)여서 편차로 봤다.
+- 나빠진 것도 있다. 쉬지 않고 쓸 때 `LFLOG_TEXT`의 p99가 0.9~1.0 → 1.3~1.5µs로 늘었다. 계측해 보니 슬롯 번호 CAS 실패가 호출당 0.9 → 2.5회로 늘었다. 호출자가 접두어를 빨리 만들어 같은 시간에 `enqueue_pos`를 더 자주 두드리기 때문이다(큐는 한 번도 차지 않음). async의 10µs 이상 비율 차이(1.3~1.5 → 1.5~1.6%)는 같은 계측에서 뮤텍스 경쟁이 그대로(호출의 44~47%)여서 편차로 봤다. bpftrace uprobe로 센 CAS 실패도 1.0 → 1.2회/호출로 같은 방향이었다(uprobe가 호출을 6.5배 느리게 해 폭은 작게 나옴). 호출마다 시각을 재지 않는 `lf_drv`에서는 `LFLOG_TEXT` 처리량이 전후 모두 약 1200만 줄/s로 같아서, 이 구간의 상한은 `enqueue_pos` CAS로 보인다.
 - 이 절보다 앞의 벤치마크 표는 모두 이 변경 전 측정이다.
 
 ## 어떤 걸 쓸까
