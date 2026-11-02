@@ -20,11 +20,14 @@ make                    # liblogx.a, example, bench, fmt_test, fmt_bench, lf_drv
 taskset -c 0-9 ./bench 8 50000 1000 11  # 락프리 로깅 스레드를 CPU 11 에 고정 + busy_poll
 ./fmt_test              # 지연 포맷팅 결과가 snprintf 와 같은지 검사
 ./fmt_bench             # 로깅 스레드의 포맷팅 비용: snprintf vs 직접 변환
-make test               # fmt_test + bench 4 50000
-make tsan               # ThreadSanitizer 빌드 후 ./bench 4 20000 (libtsan 필요)
+make test               # fmt_test + bench 4 50000 (결과는 results/*.md 로 저장)
+make results            # 대표 측정 세트(bench 포화·버스트, fmt_bench)를 results/*.md 로 저장
+make tsan               # ThreadSanitizer 빌드 후 ./bench 4 20000 (libtsan 필요, 결과 저장)
 make CFLAGS='-O2 -g -std=c11 -DLF_NO_TSC'  # TSC 대신 clock_gettime 으로 시각 저장
 make clean
 ```
+
+테스트·측정 결과는 모두 [`results/`](results/README.md)에 md 파일로 남긴다. 직접 돌리는 측정은 `tools/save_result.sh <이름> <명령...>`으로 감싸면 날짜·커밋·환경·명령·원본 출력이 함께 저장된다.
 
 `make tsan`을 실행한 뒤에는 바이너리가 TSan 빌드로 남는다. 성능을 측정하려면 `make clean && make`로 다시 빌드한다.
 
@@ -44,7 +47,9 @@ examples/
   lf_drv.c              LFLOG 만 돌리는 프로파일용 드라이버 (perf, bpftrace)
 tools/
   lf_offcpu.bt          bpftrace: 스레드별 시스템 콜·off-CPU 시간
-  run_bt.sh             lf_drv 두 조건으로 lf_offcpu.bt 실행 (sudo)
+  run_bt.sh             lf_drv 두 조건으로 lf_offcpu.bt 실행 (sudo, 결과는 results/)
+  save_result.sh        명령을 실행하고 결과를 results/<날짜>_<이름>.md 로 저장
+results/                테스트·측정 결과 원본 (README.md 에 목록과 규칙)
 Makefile
 ```
 
@@ -353,14 +358,14 @@ Log4j2 Async Logger처럼 문자열 포맷팅을 로깅 스레드로 넘긴다. 
 
 쉬지 않고 쓸 때 `LFLOG`가 가장 많이 막히는 원인을 확인했다. `bench`는 다섯 모드와 검증·정렬이 프로파일에 섞여서, `LFLOG`만 돌리는 `lf_drv`로 쟀다. `lf_drv`는 호출마다 시각을 재지 않아 `bench`보다 빨리 넣는다.
 
-**CPU 위에서 한 일** (`perf record -e cycles:u --call-graph dwarf ./lf_drv 8 200000`, root 불필요)
+**CPU 위에서 한 일** (`perf record -e cycles:u --call-graph dwarf ./lf_drv 8 200000`, root 불필요, 원본: [results](results/2026-11-02_142500_perf_lf_drv.md))
 
 | 스레드 | 비중 | 내용 |
 |---|---|---|
 | 로깅 스레드 | 99% `render_record` | 접두어 `log_format_prefix` → `snprintf` 47%, 메시지 `render_message` → `vsnprintf`·`strchr`·`parse_spec` 49% |
 | 호출 스레드 8개 | 94% `sched_yield` | `enqueue_or_wait`에서 빈 슬롯 대기. `encode_record`(실제 일)는 1.5% 미만 |
 
-**CPU 밖에 있던 시간** (`sudo tools/run_bt.sh`, `tools/lf_offcpu.bt`)
+**CPU 밖에 있던 시간** (`sudo tools/run_bt.sh`, `tools/lf_offcpu.bt`, 원본: [results](results/2026-11-02_143300_bpf_offcpu.md))
 
 | 조건 | 로깅 스레드 | 호출 스레드 (스레드당) |
 |---|---|---|
@@ -373,7 +378,7 @@ Log4j2 Async Logger처럼 문자열 포맷팅을 로깅 스레드로 넘긴다. 
 - `lf_drv 8 50000 1000`은 버스트가 아니다. 초당 400만 줄을 넣어 로깅 스레드 처리량(당시 약 300만 줄/s)을 넘기 때문에 휴식 중에도 큐를 다 비우지 못한다.
 - 그래서 [포맷팅 비용](#로깅-스레드의-포맷팅-비용-fmt_bench)의 직접 변환 + 해석 캐시(270 → 76ns/줄)가 이 구간을 직접 줄인다.
 
-**TID 조회 비용** (호출 스레드 쪽, CPU 고정, 1000만 회 × 7번 중 최솟값)
+**TID 조회 비용** (호출 스레드 쪽, CPU 고정, 1000만 회 × 7번 중 최솟값, 원본: [results](results/2026-11-02_141500_tid_cost.md))
 
 | 방식 | TID 조회 | `encode_record` |
 |---|---|---|
@@ -385,7 +390,7 @@ TID는 스레드마다 한 번만 `gettid`로 받으므로, 인자로 넘겨도 
 
 ### 시각(TSC)과 `busy_poll`의 효과 (`bench`)
 
-`LFLOG` 모드의 호출 지연. 세 변형을 번갈아 5번씩 돌렸다(몰아서 돌리면 노트북 CPU의 클럭·발열 변화가 한쪽에만 실린다). 값은 5번의 범위이고, `bench`가 호출마다 시각을 재는 비용(약 21ns)이 포함된다.
+`LFLOG` 모드의 호출 지연(원본: [results](results/2026-11-02_145000_tsc_busy_poll.md)). 세 변형을 번갈아 5번씩 돌렸다(몰아서 돌리면 노트북 CPU의 클럭·발열 변화가 한쪽에만 실린다). 값은 5번의 범위이고, `bench`가 호출마다 시각을 재는 비용(약 21ns)이 포함된다.
 
 - **TSC 없음**: `-DLF_NO_TSC` 빌드 (`clock_gettime`)
 - **TSC**: 기본 빌드
@@ -422,7 +427,7 @@ TID는 스레드마다 한 번만 `gettid`로 받으므로, 인자로 넘겨도 
 
 ### 접두어 직접 변환 적용 전후 (`bench`)
 
-`log_format_prefix`의 `snprintf`를 직접 변환으로 바꾼 전후. 바꾸기 전(커밋 `97bef09`)과 후를 번갈아 3번씩 돌린 범위다. 모든 실행에서 결과 파일 검증을 통과했다.
+`log_format_prefix`의 `snprintf`를 직접 변환으로 바꾼 전후. 바꾸기 전(커밋 `97bef09`)과 후를 번갈아 3번씩 돌린 범위다. 모든 실행에서 결과 파일 검증을 통과했다. 원본: [bench](results/2026-11-02_154000_prefix_direct.md), [경쟁 계측](results/2026-11-02_154600_contention.md).
 
 **`LFLOG` (로깅 스레드가 접두어를 만듦)**
 
@@ -449,7 +454,7 @@ TID는 스레드마다 한 번만 `gettid`로 받으므로, 인자로 넘겨도 
 - 8 스레드 버스트는 이제 로깅 스레드가 넣는 속도를 따라잡아(약 350만 줄/s) 큐가 차지 않는다. 그래서 꼬리 지연이 1 스레드 수준으로 내려왔다.
 - 쉬지 않고 쓸 때 `LFLOG`의 p99와 p99.99는 그대로다. 여전히 큐가 차서 기다리는 호출이 있다. 남은 병목은 메시지 포맷팅(`vsnprintf`와 포맷 문자열 해석)이다.
 - 호출 스레드가 포맷팅하는 모드는 p50이 100~200ns 줄었다.
-- 바뀌지 않거나 나빠진 것도 있다. 쉬지 않고 쓸 때 `LFLOG_TEXT`의 p99가 0.9~1.0 → 1.3~1.5µs로, async의 10µs 이상 비율이 1.3~1.5 → 1.5~1.6%로 조금 늘었다. 호출자가 빨라져 큐·뮤텍스 경쟁이 늘었을 가능성이 있지만 확인하지 않았다.
+- 나빠진 것도 있다. 쉬지 않고 쓸 때 `LFLOG_TEXT`의 p99가 0.9~1.0 → 1.3~1.5µs로 늘었다. 계측해 보니 슬롯 번호 CAS 실패가 호출당 0.9 → 2.5회로 늘었다. 호출자가 접두어를 빨리 만들어 같은 시간에 `enqueue_pos`를 더 자주 두드리기 때문이다(큐는 한 번도 차지 않음). async의 10µs 이상 비율 차이(1.3~1.5 → 1.5~1.6%)는 같은 계측에서 뮤텍스 경쟁이 그대로(호출의 44~47%)여서 편차로 봤다.
 - 이 절보다 앞의 벤치마크 표는 모두 이 변경 전 측정이다.
 
 ## 어떤 걸 쓸까
