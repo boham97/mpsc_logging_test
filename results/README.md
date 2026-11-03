@@ -26,5 +26,7 @@
 | [2026-11-02_155915_bench_test](2026-11-02_155915_bench_test.md) | `make test`: bench 4×5만 검증 OK |
 | [2026-11-02_160105_fmt_bench](2026-11-02_160105_fmt_bench.md) | 접두어 변경 후 fmt_bench: render_record 171ns, 메시지 캐시까지 하면 77ns |
 | [2026-11-02_160642_bpf_cas](2026-11-02_160642_bpf_cas.md) | bpftrace uprobe: LFLOG_TEXT CAS 실패 1.0 → 1.2회/호출(추적으로 폭 축소), 큐는 안 참, lf_drv 처리량은 약 12M줄/s에서 같음 |
+| [2026-11-03_091720_cmp_bench](2026-11-03_091720_cmp_bench.md) | Quill/spdlog 공개 벤치마크 조건: `LFLOG` hot path p50 99ns(numbers)·44ns(string), 처리량 3.0M줄/s |
+| [2026-11-03_093657_cmp_bench_ref](2026-11-03_093657_cmp_bench_ref.md) | 같은 머신에서 Quill/spdlog 원본과 나란히: `LFLOG` p50 은 Quill 의 약 3배(28 vs 10ns), spdlog 의 1/10; 처리량 Quill 4.67, `LFLOG` 2.98, spdlog 2.78 M줄/s |
 
 이 날 이전의 결과(지연 백분위 표 등)는 원본 출력이 남아 있지 않고 메인 README의 표로만 남아 있다.

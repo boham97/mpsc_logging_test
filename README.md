@@ -21,6 +21,8 @@ taskset -c 0-9 ./bench 8 50000 1000 11  # 락프리 로깅 스레드를 CPU 11 �
 ./fmt_test              # 지연 포맷팅 결과가 snprintf 와 같은지 검사
 ./fmt_bench             # 로깅 스레드의 포맷팅 비용: snprintf vs 직접 변환
 make test               # fmt_test + bench 4 50000 (결과는 results/*.md 로 저장)
+./cmp_bench latency lflog numbers   # Quill/spdlog 공개 벤치마크와 같은 조건 (아래 "C++ 로깅 라이브러리와 같은 벤치마크")
+tools/save_result.sh cmp_bench tools/cmp_all.sh   # Quill·spdlog 원본을 받아 빌드하고 나란히 측정 (REF=0: logx 만)
 make results            # 대표 측정 세트(bench 포화·버스트, fmt_bench)를 results/*.md 로 저장
 make tsan               # ThreadSanitizer 빌드 후 ./bench 4 20000 (libtsan 필요, 결과 저장)
 make CFLAGS='-O2 -g -std=c11 -DLF_NO_TSC'  # TSC 대신 clock_gettime 으로 시각 저장
@@ -44,11 +46,14 @@ examples/
   bench.c               처리량/호출 지연(평균·백분위) 측정, 결과 파일 정합성 검증
   fmt_test.c            지연 포맷팅 vs snprintf 비교 테스트
   fmt_bench.c           로깅 스레드 포맷팅 비용 측정 (snprintf vs 직접 변환)
+  cmp_bench.c           Quill hot path 지연·처리량, spdlog bench.cpp 와 같은 조건으로 logx 측정
   lf_drv.c              락프리 로거만 돌리는 프로파일용 드라이버 (LFLOG / LFLOG_TEXT, perf, bpftrace)
 tools/
   lf_offcpu.bt          bpftrace: 스레드별 시스템 콜·off-CPU 시간
   run_bt.sh             lf_drv 두 조건으로 lf_offcpu.bt 실행 (sudo, 결과는 results/)
   lf_cas.bt, run_bt_cas.sh  LFLOG_TEXT 슬롯 번호 CAS 시도를 uprobe 로 셈, 접두어 변경 전후 비교 (sudo)
+  ref/, ref_build.sh    Quill v13.1.0, spdlog v1.17.0 원본 벤치마크를 build/ref/ 에 받아 빌드 (헤더 전용, g++)
+  cmp_all.sh            원본과 cmp_bench 를 차례로 실행
   save_result.sh        명령을 실행하고 결과를 results/<날짜>_<이름>.md 로 저장
 results/                테스트·측정 결과 원본 (README.md 에 목록과 규칙)
 Makefile
@@ -320,6 +325,35 @@ Log4j2 Async Logger처럼 문자열 포맷팅을 로깅 스레드로 넘긴다. 
   - **디스크가 느릴 때** (NFS, fsync 등): sync buffered는 버퍼를 비우는 스레드와 뒤에서 기다리는 스레드가 모두 멈춘다. 로깅 스레드 방식은 로깅 스레드만 기다린다.
   - **로그가 뜸할 때**: 로깅 스레드 방식은 일정 시간 안에 디스크에 써진다. sync buffered에는 그런 보장이 없다.
 - sync direct는 느리지만 버퍼가 없어 크래시에 가장 안전하다.
+
+### C++ 로깅 라이브러리와 같은 벤치마크 (`./cmp_bench`)
+
+C++ 로거 비교에서 사실상 기준으로 쓰이는 Quill 벤치마크([logger_benchmarks](https://github.com/odygrd/logger_benchmarks))와 spdlog `bench/bench.cpp`의 조건을 C로 그대로 옮겼다. 아래 값은 Quill v13.1.0·spdlog v1.17.0 원본(g++ `-O3`)을 같은 머신에서 나란히 돌린 것이다 (원본: [results](results/2026-11-03_093657_cmp_bench_ref.md)).
+
+- **hot path 지연** (Quill `hot_path_latency`): 1·4 스레드, 반복마다 합쳐서 20줄, 스레드당 1만 번, 반복 사이 2.0~2.2ms 바쁜 대기. lfence+rdtsc로 20줄을 재고 줄 수로 나눈 값의 백분위. 메인 CPU 0, 작업 스레드 CPU 1~4, 로깅 스레드 CPU 5 + 잠들지 않음.
+- **처리량** (Quill `backend_throughput`): 한 스레드가 `"Iteration: %zu int: %zu double: %g"` 400만 줄, 파일에 다 쓸 때까지.
+- **spdlog bench.cpp**: `"Hello logger: msg number %d"` 25만 줄, 단일·1·4 스레드, level-off.
+
+**hot path 지연, p50 / p99.9 (ns)** — 이 머신(Ryzen 5 7430U 노트북, 튜닝 안 함)
+
+| 로거 | 숫자 1T | 숫자 4T | 긴 문자열 1T | 긴 문자열 4T |
+|---|---|---|---|---|
+| *Quill* | *10 / 38* | *20 / 82* | *12 / 65* | *26 / 126* |
+| **`LFLOG`** | **28 / 386** | **68 / 504** | **32 / 451** | **74 / 378** |
+| `LFLOG_TEXT` | 267 / 574 | 480 / 1104 | 126 / 457 | 252 / 775 |
+| async | 367 / 861 | 442 / 1212 | 118 / 497 | 204 / 655 |
+| sync buffered | 252 / 2061 | 424 / 6909 | 116 / 1803 | 212 / 6398 |
+| *spdlog async* | *287 / 749* | *490 / 1597* | *216 / 669* | *464 / 1372* |
+
+**처리량 (400만 줄)**: Quill 4.67, `LFLOG` 2.98, `LFLOG_TEXT` 3.57, async 3.67, sync buffered 3.50, spdlog async 2.78 M줄/s.
+
+**spdlog bench.cpp (25만 줄, 4스레드)**: spdlog 동기 파일 로거 3.5 M/s, sync buffered 6.7, `LFLOG` 10.8, `LFLOG_TEXT` 18.0 M/s.
+
+- `LFLOG`는 Quill보다 p50이 약 3배, p99.9가 3~10배 느리고, spdlog보다는 p50이 6~10배 빠르다.
+- Quill은 p50~p99가 거의 평평(10→14ns)한데 `LFLOG`는 p75부터 계속 오른다(28→69→103→141ns, 숫자 1T). 1스레드라 CAS 경쟁은 없으니, 바쁜 대기 중인 로깅 스레드가 방금 쓴 슬롯을 읽어 가며 생기는 캐시 라인 왕복이 후보다(아직 안 잼).
+- 처리량은 Quill의 0.64배. 상한은 로깅 스레드의 `%g` 포맷팅이다. Quill은 큐를 128MB까지 늘려 호출자를 막지 않고, logx 큐는 고정 크기다.
+- 이 노트북은 실행 간 편차가 크다. logx만 잰 앞 측정([results](results/2026-11-03_091720_cmp_bench.md))에서는 `LFLOG` 숫자 1T p50이 99ns였다.
+- 다시 재려면 `tools/save_result.sh cmp_bench_ref tools/cmp_all.sh` (한 줄로 입력).
 
 ### 로깅 스레드의 포맷팅 비용 (`./fmt_bench`)
 

@@ -6,7 +6,7 @@ CFLAGS  += -pthread
 LIB_SRC = logger/log_common.c logger/async_logger.c logger/lockfree_logger.c logger/sync_logger.c
 LIB_OBJ = $(LIB_SRC:.c=.o)
 
-all: liblogx.a example bench fmt_test fmt_bench lf_drv
+all: liblogx.a example bench fmt_test fmt_bench lf_drv cmp_bench
 
 liblogx.a: $(LIB_OBJ)
 	ar rcs $@ $^
@@ -16,6 +16,10 @@ example: examples/example.c liblogx.a
 
 bench: examples/bench.c liblogx.a
 	$(CC) $(CFLAGS) -o $@ $< liblogx.a $(LDFLAGS)
+
+# C++ 로깅 라이브러리(Quill, spdlog)의 공개 벤치마크와 같은 조건 (tools/cmp_all.sh 로 원본과 나란히)
+cmp_bench: examples/cmp_bench.c liblogx.a
+	$(CC) $(CFLAGS) -o $@ $< liblogx.a $(LDFLAGS) -lm
 
 # 프로파일용: LFLOG 만 돌린다 (perf, tools/run_bt.sh)
 lf_drv: examples/lf_drv.c liblogx.a
@@ -57,7 +61,7 @@ tsan: clean bench
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(LIB_OBJ) liblogx.a example bench fmt_test fmt_bench lf_drv lf_drv_snprintf *.log
+	rm -f $(LIB_OBJ) liblogx.a example bench fmt_test fmt_bench lf_drv lf_drv_snprintf cmp_bench *.log
 	rm -rf build
 
 .PHONY: all clean tsan test results

@@ -9,3 +9,4 @@
 perf.data*
 /lf_drv_snprintf
 /build/
+/cmp_bench
