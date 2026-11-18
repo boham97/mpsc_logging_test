@@ -562,13 +562,20 @@ static double arg_as_f64(const lf_arg *a)
     }
 }
 
+/* 꾸밈 없는 %g: snprintf 대신 직접 변환 */
+static void out_g(outbuf *o, double v)
+{
+    char tmp[LOG_G_MAX];
+    out_putn(o, tmp, log_format_g(tmp, v));
+}
+
 /* 지정자와 타입이 안 맞을 때: 타입대로 출력 */
 static void out_arg_default(outbuf *o, const lf_arg *a)
 {
     switch (a->type) {
     case LF_ARG_I64: out_printf(o, "%lld", a->v.i); break;
     case LF_ARG_U64: out_printf(o, "%llu", a->v.u); break;
-    case LF_ARG_F64: out_printf(o, "%g", a->v.d); break;
+    case LF_ARG_F64: out_g(o, a->v.d); break;
     case LF_ARG_STR: out_printf(o, "%s", a->v.s); break;
     case LF_ARG_PTR: out_printf(o, "%p", a->v.p); break;
     }
@@ -669,6 +676,10 @@ static void render_message(outbuf *o, const char *fmt, arg_reader *r)
             break;
         case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A':
             if (a.type == LF_ARG_STR || a.type == LF_ARG_PTR) { out_arg_default(o, &a); break; }
+            if (conv == 'g' && sl == 1) { /* 플래그/폭/정밀도 없음 */
+                out_g(o, arg_as_f64(&a));
+                break;
+            }
             spec[sl] = conv; spec[sl + 1] = '\0';
             out_printf(o, spec, arg_as_f64(&a));
             break;

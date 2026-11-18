@@ -16,7 +16,7 @@
 #include <unistd.h>
 
 #define PATH "fmt_test.log"
-#define MAX_CASES 160
+#define MAX_CASES 200
 
 static char expect[MAX_CASES][4096];
 static int ncases;
@@ -58,9 +58,122 @@ static char *guarded(const char *data, size_t n)
 
 enum color { RED, GREEN, BLUE };
 
+/* ======================== log_format_g 단위 검증: snprintf("%g") 와 1:1 ======================== */
+
+static long g_checked, g_fail;
+
+static double from_bits(uint64_t b)
+{
+    double d;
+    memcpy(&d, &b, 8);
+    return d;
+}
+
+static uint64_t to_bits(double d)
+{
+    uint64_t b;
+    memcpy(&b, &d, 8);
+    return b;
+}
+
+static void check_g1(double v)
+{
+    char want[64], got[LOG_G_MAX + 8];
+    snprintf(want, sizeof(want), "%g", v);
+    memset(got, '#', sizeof(got));
+    size_t n = log_format_g(got, v);
+    g_checked++;
+    if (n != strlen(want) || memcmp(got, want, n) != 0 || n > LOG_G_MAX) {
+        if (g_fail++ < 20)
+            printf("FAIL %%g bits=%016llx: want \"%s\", got \"%.*s\"\n",
+                   (unsigned long long)to_bits(v), want, (int)n, got);
+    }
+}
+
+/* v 와 그 앞뒤 ulp 몇 개, 그리고 부호를 바꾼 것 */
+static void check_g_around(double v, int k)
+{
+    uint64_t b = to_bits(v) & ~(1ULL << 63);
+    for (int d = -k; d <= k; d++) {
+        if ((d < 0 && b < (uint64_t)-d) || b + (uint64_t)d >= 0x7ff0000000000000ULL)
+            continue;
+        double x = from_bits(b + (uint64_t)d);
+        check_g1(x);
+        check_g1(-x);
+    }
+}
+
+static uint64_t g_rng = 0x9e3779b97f4a7c15ULL;
+static uint64_t g_next(void)
+{
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 7;
+    g_rng ^= g_rng << 17;
+    return g_rng;
+}
+
+static int check_g(void)
+{
+    /* 특수값과 직접 변환 범위 밖 (snprintf 로 넘어가는 쪽) */
+    const double specials[] = {0.0, -0.0, 1.0 / 0.0, -1.0 / 0.0, __builtin_nan(""), -__builtin_nan(""),
+                               2.2250738585072014e-308, 4.9e-324, 1.7976931348623157e308,
+                               1e-300, 1e300, 1.0, 0.1, 0.5, 2.5, 123456.5, 999999.5, 0.0001, 0.00009999995};
+    for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++)
+        check_g_around(specials[i], 3);
+
+    /* 십진 경계: 10^e, 9.999995*10^e(6자리 반올림이 다음 자리로 넘어가는 점), 5*10^e 근처 ulp 들 */
+    double p = 1e-25;
+    for (int e = -25; e <= 25; e++, p *= 10) {
+        check_g_around(p, 40);
+        check_g_around(9.999995 * p, 40);
+        check_g_around(9.9999949999 * p, 4);
+        check_g_around(1.000005 * p, 40);
+        check_g_around(5 * p, 4);
+    }
+
+    /* 2^b 경계마다 (지수 추정이 b 에서 정해짐), 직접 변환 범위 [-56,70] 과 그 바깥 */
+    for (int b = -80; b <= 90; b++) {
+        double x = 1.0;
+        for (int i = 0; i < (b < 0 ? -b : b); i++)
+            x = b < 0 ? x / 2 : x * 2;
+        check_g_around(x, 20);
+    }
+
+    /* 동률(정확히 반): 1000000~9999999 의 모든 정수 (끝자리 5 가 동률), 그리고 n+0.5 (n=100000~999999) */
+    for (long n = 1000000; n < 10000000; n++)
+        check_g1((double)n);
+    for (long n = 100000; n < 1000000; n++)
+        check_g1((double)n + 0.5);
+    /* cmp_bench 처리량·지연 값 */
+    for (long i = 0; i < 4000000; i += 7)
+        check_g1((double)i / 2);
+    for (long i = 0; i < 10000; i++)
+        check_g1((double)i + 0.1 * (double)i);
+
+    /* 무작위 비트: 직접 변환 범위 근처(2^-60 ~ 2^74) 2천만 개, 전체 범위 1백만 개 */
+    for (long i = 0; i < 20000000; i++) {
+        uint64_t r = g_next();
+        uint64_t be = 1023 - 60 + (r >> 52) % 135;
+        check_g1(from_bits((r & ((1ULL << 52) - 1)) | (be << 52) | (g_next() & (1ULL << 63))));
+    }
+    for (long i = 0; i < 1000000; i++)
+        check_g1(from_bits(g_next()));
+    /* 무작위 십진수: 정수 / 10^k (사람이 쓰는 값) */
+    for (long i = 0; i < 3000000; i++) {
+        double x = (double)(g_next() % 100000000);
+        for (int k = (int)(g_next() % 20); k > 0; k--)
+            x /= 10;
+        check_g1(x);
+    }
+
+    printf("log_format_g: %ld/%ld 개가 snprintf(\"%%g\") 와 같음\n", g_checked - g_fail, g_checked);
+    return g_fail ? 1 : 0;
+}
+
 int main(void)
 {
     signal(SIGSEGV, on_segv);
+    int g_bad = check_g();
     unlink(PATH);
     lf_logger *lg = lflog_open(PATH, NULL);
     if (!lg) {
@@ -79,6 +192,13 @@ int main(void)
     CASE("%f %.2f %10.3f %-10.1f| %+.0f", 3.14159, 2.71828, -1.5, 9.99, 2.5);
     CASE("%e %E %g %G %a", 12345.678, 0.000123, 1e-10, 1e20, 1.0);
     CASE("%.3e %Lf %f", 6.02e23, 1.5L, 1.25f);
+    /* 꾸밈 없는 %g 는 로깅 스레드에서 log_format_g 로 직접 변환한다 */
+    CASE("%g|%g|%g|%g|%g|%g", 0.0, -0.0, 1.0 / 0.0, -1.0 / 0.0, __builtin_nan(""), 1e-320);
+    CASE("%g %g %g %g %g", 1234567.5, 999999.5, 0.0001, 0.00001234565, 123456.5);
+    CASE("%g %g %g %Lg %g", 1e21, 3e22, 1e-17, 2.5L, 1.25f);
+    CASE("%5g|%-8g|%.3g|%+g|%#g|%G", 1.5, 2.5, 3.14159, 1.0, 1.0, 1e-10); /* 꾸밈 있으면 snprintf */
+    CASE("Iteration: %zu int: %zu double: %g", (size_t)2469135, (size_t)4938270, 1234567.5);
+    CASE("Logging iteration: %zu, message: %zu, double: %g", (size_t)9999, (size_t)0, 10998.9);
     CASE("%s|%10s|%-10s|%.3s|%.*s|%*s|", "hello", "hi", "hi", "abcdef", 2, "xyz", 6, "r");
     CASE("%*d|%-*d|%.*f|%*.*f", 6, 42, 6, 42, 2, 3.14159, 8, 3, 2.5);
     CASE("%p %p", (void *)0x1234, (void *)0);
@@ -164,5 +284,5 @@ int main(void)
         fail++;
     }
     printf("fmt_test: %d/%d passed\n", ncases - fail, ncases);
-    return fail ? 1 : 0;
+    return (fail || g_bad) ? 1 : 0;
 }

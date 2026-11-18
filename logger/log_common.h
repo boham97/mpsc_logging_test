@@ -50,6 +50,16 @@ size_t log_format_prefix(char *out, size_t cap, log_level lv, const char *file, 
 size_t log_format_line(char *out, size_t cap, log_level lv,
                        const char *file, int line, const char *fmt, va_list ap);
 
+/*
+ * snprintf(out, .., "%g", v) 와 같은 글자를 out 에 쓴다 (NUL 은 안 씀). 반환값: 쓴 바이트 수.
+ * out 은 LOG_G_MAX 바이트 이상이어야 한다.
+ * 1.4e-17 <= |v| < 2.3e21 과 0 은 정수 연산으로 직접 변환하고 (반올림: 가장 가까운 값, 동률이면 짝수),
+ * 그 밖(아주 크거나 작은 수, 비정규수, inf, nan)은 snprintf 로 넘긴다.
+ * 부동소수점 반올림 모드는 기본값(FE_TONEAREST)이라고 가정한다.
+ */
+#define LOG_G_MAX 32
+size_t log_format_g(char *out, double v);
+
 /* write()가 일부만 쓰거나 EINTR로 끊겨도 끝까지 쓴다. 성공 0, 실패 -1 */
 int log_write_all(int fd, const char *buf, size_t len);
 

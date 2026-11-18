@@ -72,6 +72,139 @@ static char *put_int(char *p, int v)
     return put_u32(p, (uint32_t)v);
 }
 
+/* ======================== %g ======================== */
+
+typedef unsigned __int128 u128;
+
+#define P10_19 10000000000000000000ULL
+static const u128 pow10_128[23] = {
+    1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL, 10000000ULL,
+    100000000ULL, 1000000000ULL, 10000000000ULL, 100000000000ULL, 1000000000000ULL,
+    10000000000000ULL, 100000000000000ULL, 1000000000000000ULL, 10000000000000000ULL,
+    100000000000000000ULL, 1000000000000000000ULL, P10_19,
+    (u128)P10_19 * 10, (u128)P10_19 * 100, (u128)P10_19 * 1000,
+};
+
+/* num / den 을 가장 가까운 정수로 (동률이면 짝수) */
+static uint64_t div_round_even(u128 num, u128 den)
+{
+    u128 q, r;
+    if ((num >> 64) == 0 && (den >> 64) == 0) { /* 흔한 경우: 64비트 나눗셈 */
+        uint64_t n = (uint64_t)num, d = (uint64_t)den;
+        q = n / d;
+        r = n % d;
+    } else {
+        q = num / den;
+        r = num % den;
+    }
+    if (2 * r > den || (2 * r == den && (q & 1)))
+        q++;
+    return (uint64_t)q;
+}
+
+/*
+ * v = m * 2^q 를 10^(e-5) 로 나눠 반올림한 값 (유효숫자 6자리 후보).
+ * 호출 범위(b = q+52 가 [-56, 70])에서 모든 중간값이 128비트에 들어간다.
+ */
+static uint64_t scaled6(uint64_t m, int q, int e)
+{
+    int s = e - 5;
+    if (s >= 0) {
+        if (q >= 0) /* v >= 2^52: m<<q < 2^71, 10^s <= 10^17 */
+            return div_round_even((u128)m << q, pow10_128[s]);
+        return div_round_even(m, pow10_128[s] << -q); /* 10^10 * 2^52 < 2^86 */
+    }
+    /* s < 0 이면 v < 1e5 이므로 q < 0. m * 10^t < 2^53 * 10^22 < 2^127, 나누기는 2^-q (-q <= 108) */
+    u128 num = (u128)m * pow10_128[-s];
+    int sh = -q;
+    u128 qt = num >> sh, r = num & (((u128)1 << sh) - 1), half = (u128)1 << (sh - 1);
+    if (r > half || (r == half && (qt & 1)))
+        qt++;
+    return (uint64_t)qt;
+}
+
+size_t log_format_g(char *out, double v)
+{
+    uint64_t bits;
+    memcpy(&bits, &v, 8);
+    int neg = (int)(bits >> 63);
+    int be = (int)((bits >> 52) & 0x7ff);
+    uint64_t m = bits & ((1ULL << 52) - 1);
+    char *p = out;
+
+    if (be == 0 && m == 0) { /* +0, -0 */
+        if (neg)
+            *p++ = '-';
+        *p++ = '0';
+        return (size_t)(p - out);
+    }
+    int b = be - 1023; /* v 는 [2^b, 2^(b+1)) */
+    if (be == 0 || be == 0x7ff || b < -56 || b > 70) {
+        int n = snprintf(out, LOG_G_MAX, "%g", v); /* 비정규수, inf, nan, 범위 밖 */
+        return n < 0 ? 0 : (size_t)n;
+    }
+    m |= 1ULL << 52;
+    int q = be - 1075;
+
+    /* 십진 지수 e: floor(b*log10(2)) 는 e 또는 e-1. 반올림으로 10^6 이 되면 한 자리 올린다 */
+    int e = (b * 78913) >> 18;
+    uint64_t n6 = scaled6(m, q, e);
+    while (n6 >= 1000000) {
+        e++;
+        n6 = scaled6(m, q, e);
+    }
+    while (n6 < 100000) { /* 추정이 한 칸 높을 때 (이론상 안 생김, 안전장치) */
+        e--;
+        n6 = scaled6(m, q, e);
+    }
+
+    char d[6];
+    for (int i = 5; i >= 0; i--) {
+        d[i] = (char)('0' + n6 % 10);
+        n6 /= 10;
+    }
+    int nd = 6; /* 끝의 0 은 %g 처럼 지운다 */
+    while (nd > 1 && d[nd - 1] == '0')
+        nd--;
+
+    if (neg)
+        *p++ = '-';
+    if (e < -4 || e >= 6) { /* d.ddddde±XX */
+        *p++ = d[0];
+        if (nd > 1) {
+            *p++ = '.';
+            memcpy(p, d + 1, (size_t)nd - 1);
+            p += nd - 1;
+        }
+        *p++ = 'e';
+        int x = e;
+        if (x < 0) {
+            *p++ = '-';
+            x = -x;
+        } else {
+            *p++ = '+';
+        }
+        memcpy(p, digits2 + x * 2, 2); /* |e| <= 22 */
+        p += 2;
+    } else if (e >= 0) { /* 정수부 e+1 자리 */
+        memcpy(p, d, (size_t)e + 1);
+        p += e + 1;
+        if (nd > e + 1) {
+            *p++ = '.';
+            memcpy(p, d + e + 1, (size_t)(nd - e - 1));
+            p += nd - e - 1;
+        }
+    } else { /* 0.000ddd */
+        *p++ = '0';
+        *p++ = '.';
+        for (int i = 0; i < -e - 1; i++)
+            *p++ = '0';
+        memcpy(p, d, (size_t)nd);
+        p += nd;
+    }
+    return (size_t)(p - out);
+}
+
 /*
  * 고정 부분(시각 19자 + 이 정도)보다 넉넉한 여유:
  * ".123456 [INFO ] " 16 + TID 11 + ' ' + ':' + 줄 11 + " | " 3 + NUL = 44

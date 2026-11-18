@@ -1,8 +1,8 @@
 /*
  * 로깅 스레드의 포맷팅 비용: snprintf vs 직접 변환.
- *  1) 변환 하나씩: %d, %lld, %u, %x, %s, %5d, 그리고 %g (snprintf 만: 아직 직접 변환 없음)
+ *  1) 변환 하나씩: %d, %lld, %u, %x, %s, %5d, %g (직접 변환은 log_format_g)
  *  2) 한 줄 전체: 지금의 render_record (지정자마다 snprintf) vs 직접 변환 고속 경로
- *     - 고속 경로는 플래그/폭/정밀도 없는 %d %i %u %x %s 만 직접 변환하고,
+ *     - 고속 경로는 플래그/폭/정밀도 없는 %d %i %u %x %s %g 만 직접 변환하고,
  *       그 외 지정자가 하나라도 있으면 지금의 render_message 로 넘긴다.
  * 측정 전에 직접 변환 결과가 snprintf / render_record 와 글자 하나까지 같은지 먼저 확인한다.
  *
@@ -130,7 +130,7 @@ static int all_simple(const char *fmt)
         }
         fmt_spec s;
         parse_spec(f + 1, &s);
-        if (!s.conv || s.nflags || s.nwidth || s.width_star || s.has_prec || !strchr("diuxs", s.conv))
+        if (!s.conv || s.nflags || s.nwidth || s.width_star || s.has_prec || !strchr("diuxsg", s.conv))
             return 0;
         f = s.end;
     }
@@ -145,7 +145,7 @@ static void put_arg_fast(outbuf *o, char conv, int lm, arg_reader *r)
         out_putn(o, "<?>", 3);
         return;
     }
-    char tmp[24];
+    char tmp[LOG_G_MAX];
     size_t n;
     switch (conv) {
     case 'd': case 'i': {
@@ -168,6 +168,10 @@ static void put_arg_fast(outbuf *o, char conv, int lm, arg_reader *r)
         n = conv == 'u' ? fmt_u64(tmp, v) : fmt_hex(tmp, v);
         break;
     }
+    case 'g':
+        if (a.type == LF_ARG_STR || a.type == LF_ARG_PTR) { out_arg_default(o, &a); return; }
+        n = log_format_g(tmp, arg_as_f64(&a));
+        break;
     default: /* 's' */
         if (a.type != LF_ARG_STR) { out_arg_default(o, &a); return; }
         out_putn(o, a.v.s, strlen(a.v.s));
@@ -552,20 +556,20 @@ int main(int argc, char **argv)
         BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%5d", ival[k] % 100000)),
         BENCH(acc += fmt_i64_width(buf, ival[k] % 100000, 5)));
 
-    /* %g: 직접 변환이 아직 없으므로 같은 값을 정수로 찍는 snprintf("%zu") 와 견준다 */
-    printf("\n  %-44s %8s %8s %8s\n", "[%g 변환 하나: snprintf]", "%g", "%zu", "배수");
+    /* %g: snprintf vs log_format_g. 참고로 같은 크기 정수 snprintf("%zu") 는 27~31ns */
+    printf("\n  %-44s %8s %8s %8s\n", "[%g 변환 하나]", "snprintf", "직접", "배수");
     row("%g  cmp 처리량 값 i/2 (예: 1234567.5)",
         BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%g", dthr[k])),
-        BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%zu", zval[k] / 2)));
+        BENCH(acc += log_format_g(buf, dthr[k])));
     row("%g  cmp 지연 값 it*1.1 (예: 10998.9)",
         BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%g", dlat[k])),
-        BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%zu", zval[k] % 10000)));
+        BENCH(acc += log_format_g(buf, dlat[k])));
     row("%g  넓은 범위 (1e-15 ~ 1e12)",
         BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%g", dwide[k])),
-        BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%zu", zval[k] / 2)));
-    row("%.17g 넓은 범위 (참고: 정밀도 최대)",
-        BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%.17g", dwide[k])),
-        BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%zu", zval[k] / 2)));
+        BENCH(acc += log_format_g(buf, dwide[k])));
+    row("%zu (참고: 같은 크기 정수, snprintf vs 직접)",
+        BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%zu", zval[k] / 2)),
+        BENCH(acc += fmt_u64(buf, zval[k] / 2)));
 
 #define MSG_BENCH(fn)                                                       \
     BENCH(rec_hdr h; memcpy(&h, lines[l].rec[k], sizeof(h));                \
