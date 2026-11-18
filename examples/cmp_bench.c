@@ -93,7 +93,10 @@ static int open_logger(logger *lg, logger_kind kind, const char *path, log_level
     case LG_LFLOG:
     case LG_LFLOG_TEXT: {
         /* Quill: backend sleep_duration = 0, cpu_affinity = {5} */
-        lf_logger_opts o = {.min_level = min_level, .capacity = 16384, .drop_on_full = 0,
+        /* 큐 슬롯 수: 기본 16384(약 16MB). CMP_LF_CAP 로 바꿀 수 있다 (Quill 은 128MB 까지 커진다) */
+        const char *cap_env = getenv("CMP_LF_CAP");
+        size_t cap = cap_env ? strtoul(cap_env, NULL, 10) : 16384;
+        lf_logger_opts o = {.min_level = min_level, .capacity = cap, .drop_on_full = 0,
                             .busy_poll = 1, .pin_consumer = 1, .consumer_cpu = BACKEND_CPU};
         lg->lf = lflog_open(path, &o);
         return lg->lf ? 0 : -1;

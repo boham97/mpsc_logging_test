@@ -54,6 +54,7 @@ tools/
   lf_cas.bt, run_bt_cas.sh  LFLOG_TEXT 슬롯 번호 CAS 시도를 uprobe 로 셈, 접두어 변경 전후 비교 (sudo)
   ref/, ref_build.sh    Quill v13.1.0, spdlog v1.17.0 원본 벤치마크를 build/ref/ 에 받아 빌드 (헤더 전용, g++)
   cmp_all.sh            원본과 cmp_bench 를 차례로 실행
+  cmp_opt.sh            logx -O2/-O3, 큐 크기(CMP_LF_CAP)를 바꿔 Quill 과 번갈아 여러 라운드 측정
   save_result.sh        명령을 실행하고 결과를 results/<날짜>_<이름>.md 로 저장
 results/                테스트·측정 결과 원본 (README.md 에 목록과 규칙)
 Makefile
@@ -353,6 +354,8 @@ C++ 로거 비교에서 사실상 기준으로 쓰이는 Quill 벤치마크([log
 - Quill은 p50~p99가 거의 평평(10→14ns)한데 `LFLOG`는 p75부터 계속 오른다(28→69→103→141ns, 숫자 1T). 1스레드라 CAS 경쟁은 없으니, 바쁜 대기 중인 로깅 스레드가 방금 쓴 슬롯을 읽어 가며 생기는 캐시 라인 왕복이 후보다(아직 안 잼).
 - 처리량은 Quill의 0.64배. 상한은 로깅 스레드의 `%g` 포맷팅이다. Quill은 큐를 128MB까지 늘려 호출자를 막지 않고, logx 큐는 고정 크기다.
 - 이 노트북은 실행 간 편차가 크다. logx만 잰 앞 측정([results](results/2026-11-03_091720_cmp_bench.md))에서는 `LFLOG` 숫자 1T p50이 99ns였다.
+- **빌드·큐 조건**: Quill·spdlog 는 g++ `-O3`, logx 는 gcc `-O2`(`Makefile` 기본). 큐는 Quill 이 128KB → 128MB 로 커지고, logx 는 16384 슬롯(약 16MB) 고정이다. logx 를 `-O3`로 빌드하거나 큐를 128MB·4GB로 키워 다시 재 보면, `-O3`는 차이가 거의 없고(처리량 2.98 vs 2.97 M줄/s), 큐를 키우면 오히려 처리량이 2.6·2.3 M줄/s로 떨어진다([results](results/2026-11-18_101741_cmp_opt.md), `tools/cmp_opt.sh`). 그래서 위 표는 기본 조건 그대로 둔다.
+- 같은 측정(11-18)에서 `LFLOG` 숫자 1T p50 은 85~89ns 였다(Quill 은 10ns 로 같음). logx 만 실행마다 약 28ns 와 약 90ns 두 상태를 오가는 것으로 보이며, 원인은 아직 모른다.
 - 다시 재려면 `tools/save_result.sh cmp_bench_ref tools/cmp_all.sh` (한 줄로 입력).
 
 ### 로깅 스레드의 포맷팅 비용 (`./fmt_bench`)

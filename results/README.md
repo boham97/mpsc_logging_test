@@ -28,5 +28,6 @@
 | [2026-11-02_160642_bpf_cas](2026-11-02_160642_bpf_cas.md) | bpftrace uprobe: LFLOG_TEXT CAS 실패 1.0 → 1.2회/호출(추적으로 폭 축소), 큐는 안 참, lf_drv 처리량은 약 12M줄/s에서 같음 |
 | [2026-11-03_091720_cmp_bench](2026-11-03_091720_cmp_bench.md) | Quill/spdlog 공개 벤치마크 조건: `LFLOG` hot path p50 99ns(numbers)·44ns(string), 처리량 3.0M줄/s |
 | [2026-11-03_093657_cmp_bench_ref](2026-11-03_093657_cmp_bench_ref.md) | 같은 머신에서 Quill/spdlog 원본과 나란히: `LFLOG` p50 은 Quill 의 약 3배(28 vs 10ns), spdlog 의 1/10; 처리량 Quill 4.67, `LFLOG` 2.98, spdlog 2.78 M줄/s |
+| [2026-11-18_101741_cmp_opt](2026-11-18_101741_cmp_opt.md) | TODO 4: `-O3` 효과 없음(처리량 2.98 vs 2.97), 큐를 128MB·4GB로 키우면 처리량이 2.6·2.3으로 떨어짐; `LFLOG` 숫자 1T p50 이 이번엔 85~89ns(11-03 의 28ns 와 다름, Quill 은 같음) |
 
 이 날 이전의 결과(지연 백분위 표 등)는 원본 출력이 남아 있지 않고 메인 README의 표로만 남아 있다.
