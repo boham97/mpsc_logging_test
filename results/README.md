@@ -29,5 +29,7 @@
 | [2026-11-03_091720_cmp_bench](2026-11-03_091720_cmp_bench.md) | Quill/spdlog 공개 벤치마크 조건: `LFLOG` hot path p50 99ns(numbers)·44ns(string), 처리량 3.0M줄/s |
 | [2026-11-03_093657_cmp_bench_ref](2026-11-03_093657_cmp_bench_ref.md) | 같은 머신에서 Quill/spdlog 원본과 나란히: `LFLOG` p50 은 Quill 의 약 3배(28 vs 10ns), spdlog 의 1/10; 처리량 Quill 4.67, `LFLOG` 2.98, spdlog 2.78 M줄/s |
 | [2026-11-18_101741_cmp_opt](2026-11-18_101741_cmp_opt.md) | TODO 4: `-O3` 효과 없음(처리량 2.98 vs 2.97), 큐를 128MB·4GB로 키우면 처리량이 2.6·2.3으로 떨어짐; `LFLOG` 숫자 1T p50 이 이번엔 85~89ns(11-03 의 28ns 와 다름, Quill 은 같음) |
+| [2026-11-18_155017_fmt_bench_g](2026-11-18_155017_fmt_bench_g.md) | `%g` 하나에 `snprintf` 148~165ns(같은 정수 `%zu`의 5배). cmp 처리량 메시지 한 줄 327ns 중 156ns 가 `%g`, 포맷팅만 본 상한 3.06 M줄/s ≈ 실제 처리량 |
+| [2026-11-18_155400_cmp_thr_perf](2026-11-18_155400_cmp_thr_perf.md) | perf: cmp 처리량에서 로깅 스레드 43.6% 가 `%g`(`__printf_fp`), `snprintf`류 합계 67.8%; 생산자는 96.5% `sched_yield` 대기 |
 
 이 날 이전의 결과(지연 백분위 표 등)는 원본 출력이 남아 있지 않고 메인 README의 표로만 남아 있다.

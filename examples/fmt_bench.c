@@ -1,6 +1,6 @@
 /*
  * 로깅 스레드의 포맷팅 비용: snprintf vs 직접 변환.
- *  1) 변환 하나씩: %d, %lld, %u, %x, %s, %5d
+ *  1) 변환 하나씩: %d, %lld, %u, %x, %s, %5d, 그리고 %g (snprintf 만: 아직 직접 변환 없음)
  *  2) 한 줄 전체: 지금의 render_record (지정자마다 snprintf) vs 직접 변환 고속 경로
  *     - 고속 경로는 플래그/폭/정밀도 없는 %d %i %u %x %s 만 직접 변환하고,
  *       그 외 지정자가 하나라도 있으면 지금의 render_message 로 넘긴다.
@@ -324,6 +324,9 @@ static unsigned long long rand_digits(int max_digits)
 static int ival[NVALS];
 static long long llval[NVALS];
 static unsigned uval[NVALS];
+/* %g 입력: cmp_bench 처리량(i/2, i<400만), cmp_bench 지연(it*1.1, it<1만), 넓은 범위(1e-9~1e12) */
+static size_t zval[NVALS];
+static double dthr[NVALS], dlat[NVALS], dwide[NVALS];
 static const char *payload = "the quick brown fox jumps over the lazy dog";
 
 /* 한 줄 전체 측정용 레코드 (로깅 스레드가 슬롯에서 읽는 것과 같은 바이트) */
@@ -332,12 +335,16 @@ typedef struct {
     char rec[NVALS][LOG_LINE_MAX];
 } line_case;
 
-static line_case lines[2];
+#define NLINES 5
+static line_case lines[NLINES];
 
 static void make_records(void)
 {
     lines[0].name = "\"T%d #%d payload=%s\" (bench 와 같음)";
     lines[1].name = "\"req=%u status=%d bytes=%d us=%d id=%x\"";
+    lines[2].name = "\"Iteration: %zu int: %zu double: %g\" (cmp_bench 처리량)";
+    lines[3].name = "  위와 같고 %g 만 %zu 로 (대조군)";
+    lines[4].name = "\"Logging iteration: %zu, message: %zu, double: %g\" (cmp_bench 지연)";
     for (int k = 0; k < NVALS; k++) {
         lf_arg a0[] = {LF_ARG(k % 16), LF_ARG(ival[k] < 0 ? -ival[k] : ival[k]), LF_ARG(payload)};
         encode_record(lines[0].rec[k], LOG_LINE_MAX, LOG_INFO, __FILE__, __LINE__,
@@ -346,6 +353,18 @@ static void make_records(void)
                        LF_ARG((int)(uval[k] % 100000)), LF_ARG(uval[NVALS - 1 - k])};
         encode_record(lines[1].rec[k], LOG_LINE_MAX, LOG_INFO, __FILE__, __LINE__,
                       "req=%u status=%d bytes=%d us=%d id=%x", a1, 5, NULL);
+        /* cmp_bench 처리량 메시지와 같은 것, 그리고 %g 만 %zu 로 바꾼 대조군 */
+        lf_arg a2[] = {LF_ARG(zval[k]), LF_ARG(zval[k] * 2), LF_ARG(dthr[k])};
+        encode_record(lines[2].rec[k], LOG_LINE_MAX, LOG_INFO, __FILE__, __LINE__,
+                      "Iteration: %zu int: %zu double: %g", a2, 3, NULL);
+        lf_arg a3[] = {LF_ARG(zval[k]), LF_ARG(zval[k] * 2), LF_ARG(zval[k] / 2)};
+        encode_record(lines[3].rec[k], LOG_LINE_MAX, LOG_INFO, __FILE__, __LINE__,
+                      "Iteration: %zu int: %zu double: %zu", a3, 3, NULL);
+        /* cmp_bench 지연(numbers) 메시지 */
+        size_t it = zval[k] % 10000;
+        lf_arg a4[] = {LF_ARG(it), LF_ARG((size_t)0), LF_ARG(dlat[k])};
+        encode_record(lines[4].rec[k], LOG_LINE_MAX, LOG_INFO, __FILE__, __LINE__,
+                      "Logging iteration: %zu, message: %zu, double: %g", a4, 3, NULL);
     }
 }
 
@@ -424,7 +443,7 @@ static void check_correctness(void)
         expect_same("%x", a, fmt_hex(a, uval[k]), b);
         snprintf(b, sizeof(b), "%5d", ival[k] % 100000);
         expect_same("%5d", a, fmt_i64_width(a, ival[k] % 100000, 5), b);
-        for (int l = 0; l < 2; l++) {
+        for (int l = 0; l < NLINES; l++) {
             size_t nb = render_record(b, LOG_LINE_MAX, lines[l].rec[k], &bench_clock);
             b[nb] = '\0';
             expect_same("render_record_fast", c, render_record_fast(c, LOG_LINE_MAX, lines[l].rec[k]), b);
@@ -500,6 +519,13 @@ int main(int argc, char **argv)
         ival[k] = (int)rand_digits(9) * ((xorshift() & 1) ? 1 : -1);
         llval[k] = (long long)rand_digits(18) * ((xorshift() & 1) ? 1 : -1);
         uval[k] = (unsigned)rand_digits(9);
+        zval[k] = (size_t)(xorshift() % 4000000);
+        dthr[k] = (double)zval[k] / 2;
+        dlat[k] = (double)(zval[k] % 10000) + 0.1 * (double)(zval[k] % 10000);
+        double sc = 1e-15; /* 1e-15 ~ 1e6 배율 (math.h 없이) */
+        for (int e = (int)(xorshift() % 22); e > 0; e--)
+            sc *= 10;
+        dwide[k] = (double)(xorshift() % 1000000) * sc;
     }
     make_records();
     check_correctness();
@@ -526,6 +552,21 @@ int main(int argc, char **argv)
         BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%5d", ival[k] % 100000)),
         BENCH(acc += fmt_i64_width(buf, ival[k] % 100000, 5)));
 
+    /* %g: 직접 변환이 아직 없으므로 같은 값을 정수로 찍는 snprintf("%zu") 와 견준다 */
+    printf("\n  %-44s %8s %8s %8s\n", "[%g 변환 하나: snprintf]", "%g", "%zu", "배수");
+    row("%g  cmp 처리량 값 i/2 (예: 1234567.5)",
+        BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%g", dthr[k])),
+        BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%zu", zval[k] / 2)));
+    row("%g  cmp 지연 값 it*1.1 (예: 10998.9)",
+        BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%g", dlat[k])),
+        BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%zu", zval[k] % 10000)));
+    row("%g  넓은 범위 (1e-15 ~ 1e12)",
+        BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%g", dwide[k])),
+        BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%zu", zval[k] / 2)));
+    row("%.17g 넓은 범위 (참고: 정밀도 최대)",
+        BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%.17g", dwide[k])),
+        BENCH(acc += (size_t)snprintf_p(buf, sizeof(buf), "%zu", zval[k] / 2)));
+
 #define MSG_BENCH(fn)                                                       \
     BENCH(rec_hdr h; memcpy(&h, lines[l].rec[k], sizeof(h));                \
           outbuf o = {buf, 0, sizeof(buf) - 1};                             \
@@ -534,7 +575,7 @@ int main(int argc, char **argv)
 
     printf("\n  [한 줄 전체: 슬롯의 레코드 → 완성된 줄]\n");
     printf("  %-44s %8s %8s %8s %8s\n", "", "현재", "직접", "직접+캐시", "배수");
-    for (int l = 0; l < 2; l++) {
+    for (int l = 0; l < NLINES; l++) {
         printf("  %s\n", lines[l].name);
         double ps = BENCH(rec_hdr h; memcpy(&h, lines[l].rec[k], sizeof(h));
                           struct timespec ts; clock_to_timespec(&bench_clock, h.stamp, &ts);
