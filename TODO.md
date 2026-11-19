@@ -51,6 +51,7 @@
 **확인 방법**
 - `perf c2c record/report`로 호출 스레드와 로깅 스레드 사이의 HITM(공유 라인 충돌)을 본다 → a 확인.
   - 2026-11-19 시도했으나 이 머신에서는 안 된다(`sudo tools/run_c2c.sh`, `results/2026-11-19_104852_c2c_string_1.md`). Zen3 IBS 는 데이터 출처 68% 를 해석하지 못하고 Peer load·공유 라인이 0 으로 나온다. 경합이 없다는 뜻이 아니다. 대신 PMU 이벤트 `ls_dmnd_fills_from_sys.int_cache` 등을 스레드별로 센다.
+  - 2026-11-19 PMU 로 셈(`sudo tools/run_pmu.sh`, `results/2026-11-19_105736_pmu_string_1.md`). 1줄당 다른 코어 쪽에서 가져온 줄이 호출자 1.1~1.5번, 로깅 스레드 1.4~1.7번이다 → a 는 비용의 일부로 보인다. 1T 동안 클럭은 4.33GHz 고정이라 느린 상태의 원인이 아니다. 세 실행이 모두 느린 상태(p50 95~127ns)여서 빠른 실행과는 아직 비교 못 함.
 - 로깅 스레드를 끄거나 느리게 소비하는 모드(큐가 차지 않을 만큼만 쌓기)에서 hot path 를 다시 잰다. 분포가 평평해지면 a.
 - `perf stat -e L1-dcache-load-misses,cycle_activity.stalls_l2_miss` 등을 hot path 구간에서 잰다.
 - 생산자 쪽 원자 연산을 하나씩 빼 보는 마이크로벤치 → b, d 비용 분리.
