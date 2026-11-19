@@ -51,6 +51,7 @@ examples/
 tools/
   lf_offcpu.bt          bpftrace: 스레드별 시스템 콜·off-CPU 시간
   run_bt.sh             lf_drv 두 조건으로 lf_offcpu.bt 실행 (sudo, 결과는 results/)
+  run_bt_cmp.sh         cmp_bench 지연 측정을 여러 번 lf_offcpu.bt 로 추적 (sudo)
   lf_cas.bt, run_bt_cas.sh  LFLOG_TEXT 슬롯 번호 CAS 시도를 uprobe 로 셈, 접두어 변경 전후 비교 (sudo)
   ref/, ref_build.sh    Quill v13.1.0, spdlog v1.17.0 원본 벤치마크를 build/ref/ 에 받아 빌드 (헤더 전용, g++)
   cmp_all.sh            원본과 cmp_bench 를 차례로 실행
